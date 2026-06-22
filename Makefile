@@ -7,12 +7,15 @@ RM_CMD = rm -f $(TARGET) $(OBJS)
 endif
 
 CXX := g++
+CC := gcc
 
 CXXFLAGS := -std=c++17 -Wall -Wextra -O2
+CFLAGS := -std=c11 -Wall -Wextra -O2
 CPPFLAGS := -I. -ILZSS
 
-SRCS := $(wildcard *.cpp) $(wildcard LZSS/*.cpp)
-OBJS := $(SRCS:.cpp=.o)
+CPP_SRCS := $(wildcard *.cpp) $(wildcard LZSS/*.cpp)
+C_SRCS := $(wildcard *.c)
+OBJS := $(CPP_SRCS:.cpp=.o) $(C_SRCS:.c=.o)
 
 all: $(TARGET)
 
@@ -21,6 +24,9 @@ $(TARGET): $(OBJS)
 
 %.o: %.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+%.o: %.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 clean:
 	-$(RM_CMD)

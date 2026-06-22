@@ -3,8 +3,13 @@
 #define AC_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "bio.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 struct symbol {
 	size_t symb;
@@ -17,11 +22,10 @@ void count_cum_freqs(struct symbol *table, size_t symbols);
 size_t calc_total_freq(struct symbol *table, size_t symbols);
 
 struct ac {
-	size_t mLow;
-	size_t mHigh;
-
-	size_t mBuffer;
-	size_t mScale;
+	uint32_t mLow;
+	uint32_t mHigh;
+	uint32_t mBuffer;
+	uint32_t mScale;
 };
 
 void ac_init(struct ac *ac);
@@ -38,6 +42,17 @@ struct model {
 	struct symbol *table; /* count entries */
 };
 
+void ac_encode_bypass_bits(
+	struct bio *bio,
+	uint32_t value,
+	size_t bit_count
+);
+
+uint32_t ac_decode_bypass_bits(
+	struct bio *bio,
+	size_t bit_count
+);
+
 void ac_encode_symbol_model(struct ac *ac, struct bio *bio, size_t symb, struct model *model);
 float ac_encode_symbol_model_query_prob(size_t symb, struct model *model);
 size_t ac_decode_symbol_model(struct ac *ac, struct bio *bio, struct model *model);
@@ -46,5 +61,12 @@ void inc_model(struct model *model, size_t symbol);
 void model_create(struct model *model, size_t size);
 void model_enlarge(struct model *model);
 void model_destroy(struct model *model);
+
+void model_rescale(struct model *model);
+void model_update(struct model *model, size_t symbol);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* AC_H */

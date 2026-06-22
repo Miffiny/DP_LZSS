@@ -27,7 +27,7 @@ bool lzss_encode(const uint8_t* input, size_t input_size,
             token_stream_push(out_stream, token);
 
             for (size_t i = 0; i < match.length; ++i) {
-                match_finder_insert_position(mf, input, pos + i);
+                match_finder_insert_position(mf, input, pos + i, input_size);
             }
             pos += match.length;
         } else {
@@ -36,7 +36,7 @@ bool lzss_encode(const uint8_t* input, size_t input_size,
             token.literal = input[pos];
             token_stream_push(out_stream, token);
 
-            match_finder_insert_position(mf, input, pos);
+            match_finder_insert_position(mf, input, pos, input_size);
             pos += 1;
         }
     }

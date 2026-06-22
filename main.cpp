@@ -4,5 +4,5 @@
 
 int main()
 {
-    return run_lzss_quickcheck(std::cout, std::cerr) ? 0 : 1;
+    return run_silesia_benchmark(std::cout, std::cerr) ? 0 : 1;
 }

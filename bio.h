@@ -8,6 +8,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 enum {
 	BIO_MODE_READ,
 	BIO_MODE_WRITE
@@ -27,5 +31,9 @@ void bio_close(struct bio *bio, int mode);
 void bio_write_bits(struct bio *bio, uint32_t b, size_t n);
 
 uint32_t bio_read_bits(struct bio *bio, size_t n);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* BIO_H_ */

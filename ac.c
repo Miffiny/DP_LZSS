@@ -1,5 +1,3 @@
-//TODO modify ac
-
 #include "ac.h"
 
 #include <assert.h>
@@ -47,41 +45,54 @@ void ac_init(struct ac *ac)
 
 void ac_encode_scale(struct ac *ac, struct bio *bio)
 {
-	// E1/E2
-	while ((ac->mHigh < g_Half) || (ac->mLow >= g_Half)) {
+	for (;;) {
 		if (ac->mHigh < g_Half) {
 			put_bit(bio, 0);
-			ac->mLow  = 2 * ac->mLow;
-			ac->mHigh = 2 * ac->mHigh + 1;
 
-			for (; ac->mScale > 0; ac->mScale--) {
+			while (ac->mScale > 0) {
 				put_bit(bio, 1);
-			}
-		} else if (ac->mLow >= g_Half) {
-			put_bit(bio, 1);
-			ac->mLow  = 2 * (ac->mLow  - g_Half);
-			ac->mHigh = 2 * (ac->mHigh - g_Half) + 1;
-
-			for (; ac->mScale > 0; ac->mScale--) {
-				put_bit(bio, 0);
+				ac->mScale--;
 			}
 		}
-	}
+		else if (ac->mLow >= g_Half) {
+			put_bit(bio, 1);
 
-	// E3
-	while ((g_FirstQuarter <= ac->mLow) && (ac->mHigh < g_ThirdQuarter)) {
-		ac->mScale++;
-		ac->mLow  = 2 * (ac->mLow  - g_FirstQuarter);
-		ac->mHigh = 2 * (ac->mHigh - g_FirstQuarter) + 1;
+			while (ac->mScale > 0) {
+				put_bit(bio, 0);
+				ac->mScale--;
+			}
+
+			ac->mLow  -= g_Half;
+			ac->mHigh -= g_Half;
+		}
+		else if (ac->mLow >= g_FirstQuarter &&
+				 ac->mHigh < g_ThirdQuarter) {
+			ac->mScale++;
+			ac->mLow  -= g_FirstQuarter;
+			ac->mHigh -= g_FirstQuarter;
+				 }
+		else {
+			break;
+		}
+
+		ac->mLow  <<= 1;
+		ac->mHigh = (ac->mHigh << 1) | 1;
 	}
 }
 
 void ac_encode(struct ac *ac, struct bio *bio, size_t low_freq, size_t high_freq, size_t total)
 {
-	size_t mStep = (ac->mHigh - ac->mLow + 1) / total;
+	uint64_t range =
+		(uint64_t)ac->mHigh - ac->mLow + 1;
 
-	ac->mHigh = ac->mLow + mStep * high_freq - 1;
-	ac->mLow  = ac->mLow + mStep * low_freq;
+	uint64_t new_low =
+		range * low_freq / total;
+
+	uint64_t new_high =
+		range * high_freq / total;
+
+	ac->mLow += (uint32_t)new_low;
+	ac->mHigh = ac->mLow + (uint32_t)(new_high - new_low) - 1;
 
 	ac_encode_scale(ac, bio);
 }
@@ -114,22 +125,49 @@ float ac_encode_symbol_query_prob(size_t symb, struct symbol *model, size_t symb
 	return (float)model[index].freq / total_count;
 }
 
+void ac_encode_bypass_bits(
+	struct bio *bio,
+	uint32_t value,
+	size_t bit_count)
+{
+	bio_write_bits(bio, value, bit_count);
+}
+
+uint32_t ac_decode_bypass_bits(
+	struct bio *bio,
+	size_t bit_count)
+{
+	return bio_read_bits(bio, bit_count);
+}
+
 void ac_encode_flush(struct ac *ac, struct bio *bio)
 {
+	ac->mScale++;
+
 	if (ac->mLow < g_FirstQuarter) {
 		put_bit(bio, 0);
 
-		for (size_t i=0; i < ac->mScale + 1; i++) {
+		while (ac->mScale-- > 0) {
 			put_bit(bio, 1);
 		}
 	} else {
 		put_bit(bio, 1);
+
+		while (ac->mScale-- > 0) {
+			put_bit(bio, 0);
+		}
 	}
 }
 
-size_t ac_decode_target(struct ac *ac, size_t mStep)
+static size_t ac_decode_target(const struct ac *ac, size_t total)
 {
-	return (ac->mBuffer - ac->mLow) / mStep;
+	const uint64_t range =
+		(uint64_t)ac->mHigh - ac->mLow + 1;
+
+	const uint64_t offset =
+		(uint64_t)ac->mBuffer - ac->mLow + 1;
+
+	return (offset * total - 1) / range;
 }
 
 void ac_decode_init(struct ac *ac, struct bio *bio)
@@ -143,26 +181,30 @@ void ac_decode_init(struct ac *ac, struct bio *bio)
 
 void ac_decode_scale(struct ac *ac, struct bio *bio)
 {
-	// E1/E2
-	while ((ac->mHigh < g_Half) || (ac->mLow >= g_Half)) {
+	for (;;) {
 		if (ac->mHigh < g_Half) {
-			ac->mLow    = 2 * ac->mLow;
-			ac->mHigh   = 2 * ac->mHigh + 1;
-			ac->mBuffer = 2 * ac->mBuffer + get_bit(bio);
-		} else if (ac->mLow >= g_Half) {
-			ac->mLow    = 2 * (ac->mLow    - g_Half);
-			ac->mHigh   = 2 * (ac->mHigh   - g_Half) + 1;
-			ac->mBuffer = 2 * (ac->mBuffer - g_Half) + get_bit(bio);
+			// E1: no subtraction is needed.
 		}
-		ac->mScale = 0;
-	}
+		else if (ac->mLow >= g_Half) {
+			// E2
+			ac->mLow    -= g_Half;
+			ac->mHigh   -= g_Half;
+			ac->mBuffer -= g_Half;
+		}
+		else if (ac->mLow >= g_FirstQuarter &&
+				 ac->mHigh < g_ThirdQuarter) {
+			// E3
+			ac->mLow    -= g_FirstQuarter;
+			ac->mHigh   -= g_FirstQuarter;
+			ac->mBuffer -= g_FirstQuarter;
+				 }
+		else {
+			break;
+		}
 
-	// E3
-	while ((g_FirstQuarter <= ac->mLow) && (ac->mHigh < g_ThirdQuarter)) {
-		ac->mScale++;
-		ac->mLow    = 2 * (ac->mLow    - g_FirstQuarter);
-		ac->mHigh   = 2 * (ac->mHigh   - g_FirstQuarter) + 1;
-		ac->mBuffer = 2 * (ac->mBuffer - g_FirstQuarter) + get_bit(bio);
+		ac->mLow    <<= 1;
+		ac->mHigh    = (ac->mHigh << 1) | 1u;
+		ac->mBuffer  = (ac->mBuffer << 1) | get_bit(bio);
 	}
 }
 
@@ -182,17 +224,26 @@ size_t index_of_value(size_t value, struct symbol *model, size_t symbols)
 
 size_t ac_decode_symbol(struct ac *ac, struct bio *bio, struct symbol *model, size_t symbols, size_t total)
 {
-	size_t mStep = (ac->mHigh - ac->mLow + 1) / total;
+	const size_t value = ac_decode_target(ac, total);
 
-	size_t value = ac_decode_target(ac, mStep);
+	const size_t index =
+		index_of_value(value, model, symbols);
 
-	size_t index = index_of_value(value, model, symbols);
+	const size_t low_freq  = model[index].cum_freq;
+	const size_t high_freq = low_freq + model[index].freq;
 
-	size_t low_freq  = model[index].cum_freq;
-	size_t high_freq = model[index].cum_freq + model[index].freq;
+	const uint64_t range =
+		(uint64_t)ac->mHigh - ac->mLow + 1;
 
-	ac->mHigh = ac->mLow + mStep * high_freq - 1;
-	ac->mLow  = ac->mLow + mStep * low_freq;
+	const uint64_t new_low =
+		range * low_freq / total;
+
+	const uint64_t new_high =
+		range * high_freq / total;
+
+	ac->mLow += (uint32_t)new_low;
+	ac->mHigh =
+		ac->mLow + (uint32_t)(new_high - new_low) - 1;
 
 	ac_decode_scale(ac, bio);
 
@@ -216,17 +267,12 @@ size_t ac_decode_symbol_model(struct ac *ac, struct bio *bio, struct model *mode
 
 void inc_model(struct model *model, size_t symbol)
 {
-#if 1
-	// FIXME BUG
-	const size_t index = symbol;
-#else
 	size_t index = index_of_symbol(symbol, model->table, model->count);
-#endif
-	const size_t increment = 1;
 
-	model->table[index].freq += increment;
+	model->table[index].freq++;
+	model->total++;
+
 	count_cum_freqs(model->table, model->count);
-	model->total += increment;
 }
 
 void model_create(struct model *model, size_t size)
@@ -272,4 +318,38 @@ void model_destroy(struct model *model)
 	assert(model != NULL);
 
 	free(model->table);
+}
+
+enum {
+	MODEL_MAX_TOTAL = 1u << 20
+};
+
+void model_rescale(struct model *model)
+{
+	for (size_t i = 0; i < model->count; ++i) {
+		model->table[i].freq =
+			(model->table[i].freq + 1) / 2;
+
+		if (model->table[i].freq == 0) {
+			model->table[i].freq = 1;
+		}
+	}
+
+	count_cum_freqs(model->table, model->count);
+	model->total = calc_total_freq(model->table, model->count);
+}
+
+void model_update(struct model *model, size_t symbol)
+{
+	size_t index =
+		index_of_symbol(symbol, model->table, model->count);
+
+	model->table[index].freq++;
+	model->total++;
+
+	if (model->total >= MODEL_MAX_TOTAL) {
+		model_rescale(model);
+	} else {
+		count_cum_freqs(model->table, model->count);
+	}
 }
