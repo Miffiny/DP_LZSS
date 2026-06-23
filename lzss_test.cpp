@@ -1,4 +1,3 @@
-//TODO make better tests, base generated tests are implemented
 #include "lzss_test.h"
 
 #include "LZSS/decoder.h"
@@ -7,7 +6,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -352,7 +350,7 @@ bool run_lzss_quickcheck(std::ostream& out, std::ostream& err)
 
 bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
 {
-    const std::filesystem::path dataset_dir = "silesia";
+    const std::filesystem::path dataset_dir = "datasets";
     const LzssConfig config{
         4096,
         3,
