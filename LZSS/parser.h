@@ -15,11 +15,7 @@ typedef struct {
     size_t window_size;
     size_t min_match_length;
     size_t max_match_length;
-    //TODO + need to add some experiments with it
-    //bool use_lazy_match;
-
-    //TODO for future use
-    //LzssParseMode parse_mode;
+    LzssParseMode parse_mode;
     //size_t max_candidates;
 } LzssConfig;
 
