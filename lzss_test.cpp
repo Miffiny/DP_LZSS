@@ -311,7 +311,8 @@ bool run_lzss_quickcheck(std::ostream& out, std::ostream& err)
     const LzssConfig config{
         4096,
         3,
-        18
+        18,
+        LZSS_PARSE_LAZY
     };
 
     std::mt19937 rng(0x9f723abc);
@@ -354,7 +355,8 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
     const LzssConfig config{
         4096,
         3,
-        18
+        18,
+        LZSS_PARSE_LAZY
     };
 
     if (!std::filesystem::exists(dataset_dir)) {
@@ -414,9 +416,9 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
             << std::right << std::setw(13) << input.size()
             << std::setw(13) << result.compressed_size
             << std::setw(11) << std::fixed << std::setprecision(3) << factor
-            << std::setw(14) << std::fixed << std::setprecision(2)
+            << std::setw(14) << std::fixed << std::setprecision(0)
             << result.compress_ms
-            << std::setw(14) << std::fixed << std::setprecision(2)
+            << std::setw(14) << std::fixed << std::setprecision(0)
             << result.decompress_ms
             << std::setw(12) << result.token_count
             << (result.ok ? "" : "  FAIL")
