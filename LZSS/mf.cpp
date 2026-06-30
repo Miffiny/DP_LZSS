@@ -1,6 +1,7 @@
 #include "mf.h"
 #include <cstdlib>
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -14,9 +15,10 @@ struct LzssMatchFinder {
 };
 
 static constexpr size_t NO_POSITION = std::numeric_limits<size_t>::max();
-static constexpr size_t HASH_SIZE = 1u << 16;
+static constexpr size_t HASH_BYTES = 4;
+static constexpr size_t HASH_SIZE = 1u << 17;
 static constexpr size_t MAX_CHAIN_LENGTH = 256;
-static constexpr size_t GOOD_MATCH_LENGTH = 16;
+static constexpr size_t GOOD_MATCH_LENGTH = 32;
 
 static size_t window_slot(const LzssMatchFinder* mf, size_t position)
 {
@@ -37,12 +39,16 @@ static size_t get_chain_next(const LzssMatchFinder* mf, size_t position)
     return mf->next[slot];
 }
 
-static size_t hash3(const uint8_t *buffer, size_t pos)
+static uint32_t load32(const uint8_t *buffer, size_t pos)
 {
-    uint32_t value =
-        (static_cast<uint32_t>(buffer[pos]) << 16) ^
-        (static_cast<uint32_t>(buffer[pos + 1]) << 8) ^
-        static_cast<uint32_t>(buffer[pos + 2]);
+    uint32_t value;
+    std::memcpy(&value, buffer + pos, sizeof(value));
+    return value;
+}
+
+static size_t hash4(const uint8_t *buffer, size_t pos)
+{
+    uint32_t value = load32(buffer, pos);
 
     value ^= value >> 9;
     value *= 0x9e3779b1u;
@@ -71,11 +77,12 @@ void match_finder_destroy(LzssMatchFinder* mf) {
 
 void match_finder_insert_position(LzssMatchFinder *mf, const uint8_t *input,
                                   size_t position, size_t buffer_size) {
-    if (mf == nullptr || input == nullptr || position + 3 > buffer_size) {
+    if (mf == nullptr || input == nullptr ||
+        position + HASH_BYTES > buffer_size) {
         return;
     }
 
-    const size_t hash = hash3(input, position);
+    const size_t hash = hash4(input, position);
     const size_t slot = window_slot(mf, position);
 
     mf->next[slot] = mf->head[hash];
@@ -99,11 +106,12 @@ bool match_finder_get_best(LzssMatchFinder* mf, const uint8_t* buffer,
 
     if (max_len < min_len) return false;
 
-    if (pos + 3 > buffer_size || min_len < 3) {
+    if (pos + HASH_BYTES > buffer_size || min_len < HASH_BYTES) {
         return false;
     }
 
-    const size_t hash = hash3(buffer, pos);
+    const size_t hash = hash4(buffer, pos);
+    const uint32_t current_key = load32(buffer, pos);
     size_t search_pos = mf->head[hash];
     size_t chain_len = 0;
 
@@ -120,6 +128,11 @@ bool match_finder_get_best(LzssMatchFinder* mf, const uint8_t* buffer,
             break;
         }
 
+        if (load32(buffer, search_pos) != current_key) {
+            search_pos = get_chain_next(mf, search_pos);
+            continue;
+        }
+
         if (best_len > 0 &&
             best_len < max_len &&
             buffer[search_pos + best_len] != buffer[pos + best_len]) {
@@ -127,7 +140,7 @@ bool match_finder_get_best(LzssMatchFinder* mf, const uint8_t* buffer,
             continue;
         }
 
-        size_t current_len = 0;
+        size_t current_len = HASH_BYTES;
 
         while (current_len < max_len &&
                buffer[search_pos + current_len] == buffer[pos + current_len]) {
