@@ -11,13 +11,15 @@
 struct LzssArithmeticCodec {
     LzssConfig config;
 
-    // Number of bits for distance - 1
-    size_t distance_bit_count;
+    size_t length_extra_bit_count;
+    size_t distance_extra_bit_count;
 
     struct model event_model;    // LITERAL / MATCH / EOF
     struct model literal_model;  // 0..255
-    struct model length_model;   // length - min_match_length
-    struct model *distance_bit_models;
+    struct model length_model;   // Deflate-like length class
+    struct model distance_model; // Deflate-like distance class
+    struct model *length_extra_bit_models;
+    struct model *distance_extra_bit_models;
 };
 
 bool lzss_ac_codec_init(

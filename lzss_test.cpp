@@ -309,9 +309,9 @@ static bool run_case(const std::string& name, const std::vector<uint8_t>& input,
 bool run_lzss_quickcheck(std::ostream& out, std::ostream& err)
 {
     const LzssConfig config{
-        4096,
-        3,
-        18,
+        65536,
+        4,
+        258,
         LZSS_PARSE_LAZY
     };
 
@@ -353,9 +353,9 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
 {
     const std::filesystem::path dataset_dir = "datasets";
     const LzssConfig config{
-        4096,
-        3,
-        18,
+        65536,
+        4,
+        258,
         LZSS_PARSE_LAZY
     };
 
