@@ -1,8 +1,10 @@
 #include "arithmetic.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <vector>
 
 struct DeflateClass {
     uint32_t base;
@@ -246,6 +248,8 @@ static bool token_is_valid(
     }
 }
 
+#if 0
+// Adaptive extra-bit and length/distance coding.
 static void encode_extra_bits(
     struct ac *ac,
     struct bio *bio,
@@ -269,7 +273,203 @@ static void encode_extra_bits(
         model_update(model, bit);
     }
 }
+#endif
 
+static bool write_u32(struct bio *bio, uint32_t value)
+{
+    ac_encode_bypass_bits(bio, value, 32);
+    return true;
+}
+
+static uint32_t read_u32(struct bio *bio)
+{
+    return ac_decode_bypass_bits(bio, 32);
+}
+
+static bool checked_size_to_u32(size_t value, uint32_t *out_value)
+{
+    if (value > UINT32_MAX) {
+        return false;
+    }
+
+    *out_value = static_cast<uint32_t>(value);
+    return true;
+}
+
+static bool model_set_frequencies(
+    struct model *model,
+    const std::vector<uint32_t>& frequencies)
+{
+    if (model == nullptr ||
+        model->table == nullptr ||
+        model->count != frequencies.size()) {
+        return false;
+    }
+
+    size_t total = 0;
+
+    for (size_t i = 0; i < model->count; ++i) {
+        model->table[i].symb = i;
+        model->table[i].freq = frequencies[i];
+
+        if (total > std::numeric_limits<size_t>::max() -
+                        static_cast<size_t>(frequencies[i])) {
+            return false;
+        }
+
+        total += frequencies[i];
+    }
+
+    count_cum_freqs(model->table, model->count);
+    model->total = total;
+    return true;
+}
+
+static bool write_model_frequencies(struct bio *bio, const struct model *model)
+{
+    if (bio == nullptr || model == nullptr || model->table == nullptr) {
+        return false;
+    }
+
+    for (size_t i = 0; i < model->count; ++i) {
+        uint32_t freq = 0;
+
+        if (!checked_size_to_u32(model->table[i].freq, &freq) ||
+            !write_u32(bio, freq)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool read_model_frequencies(struct bio *bio, struct model *model)
+{
+    if (bio == nullptr || model == nullptr || model->table == nullptr) {
+        return false;
+    }
+
+    std::vector<uint32_t> frequencies(model->count);
+
+    for (size_t i = 0; i < model->count; ++i) {
+        frequencies[i] = read_u32(bio);
+    }
+
+    return model_set_frequencies(model, frequencies);
+}
+
+static bool write_static_model_header(
+    struct bio *bio,
+    const LzssArithmeticCodec *codec)
+{
+    return write_model_frequencies(bio, &codec->event_model) &&
+           write_model_frequencies(bio, &codec->literal_model) &&
+           write_model_frequencies(bio, &codec->length_model) &&
+           write_model_frequencies(bio, &codec->distance_model);
+}
+
+static bool read_static_model_header(
+    struct bio *bio,
+    LzssArithmeticCodec *codec)
+{
+    if (!read_model_frequencies(bio, &codec->event_model) ||
+        !read_model_frequencies(bio, &codec->literal_model) ||
+        !read_model_frequencies(bio, &codec->length_model) ||
+        !read_model_frequencies(bio, &codec->distance_model)) {
+        return false;
+    }
+
+    return codec->event_model.total > 0;
+}
+
+static bool collect_static_model_stats(
+    LzssArithmeticCodec *codec,
+    const LzssTokenStream *stream)
+{
+    if (codec == nullptr ||
+        stream == nullptr ||
+        (stream->count > 0 && stream->tokens == nullptr)) {
+        return false;
+    }
+
+    std::vector<uint32_t> event_frequencies(codec->event_model.count, 0);
+    std::vector<uint32_t> literal_frequencies(codec->literal_model.count, 0);
+    std::vector<uint32_t> length_frequencies(codec->length_model.count, 0);
+    std::vector<uint32_t> distance_frequencies(codec->distance_model.count, 0);
+
+    bool eof_seen = false;
+
+    for (size_t i = 0; i < stream->count; ++i) {
+        const LzssToken *token = &stream->tokens[i];
+
+        if (!token_is_valid(codec, token) || eof_seen) {
+            return false;
+        }
+
+        if (token->type == LZSS_TOKEN_EOF &&
+            i + 1 != stream->count) {
+            return false;
+        }
+
+        event_frequencies[token->type]++;
+
+        switch (token->type) {
+        case LZSS_TOKEN_LITERAL:
+            literal_frequencies[token->literal]++;
+            break;
+
+        case LZSS_TOKEN_MATCH: {
+            size_t length_symbol = 0;
+            const DeflateClass *length_class = nullptr;
+
+            if (!find_class_for_value(
+                    LENGTH_CLASSES,
+                    array_count(LENGTH_CLASSES),
+                    static_cast<uint32_t>(codec->config.min_match_length),
+                    static_cast<uint32_t>(codec->config.max_match_length),
+                    token->match.length,
+                    &length_symbol,
+                    &length_class)) {
+                return false;
+            }
+
+            size_t distance_symbol = 0;
+            const DeflateClass *distance_class = nullptr;
+
+            if (!find_class_for_value(
+                    DISTANCE_CLASSES,
+                    array_count(DISTANCE_CLASSES),
+                    1,
+                    static_cast<uint32_t>(codec->config.window_size),
+                    token->match.distance,
+                    &distance_symbol,
+                    &distance_class)) {
+                return false;
+            }
+
+            length_frequencies[length_symbol]++;
+            distance_frequencies[distance_symbol]++;
+            break;
+        }
+
+        case LZSS_TOKEN_EOF:
+            eof_seen = true;
+            break;
+
+        default:
+            return false;
+        }
+    }
+
+    return eof_seen &&
+           model_set_frequencies(&codec->event_model, event_frequencies) &&
+           model_set_frequencies(&codec->literal_model, literal_frequencies) &&
+           model_set_frequencies(&codec->length_model, length_frequencies) &&
+           model_set_frequencies(&codec->distance_model, distance_frequencies);
+}
+
+#if 0
+// Adaptive decode/update path
 static bool decode_extra_bits(
     struct ac *ac,
     struct bio *bio,
@@ -507,6 +707,186 @@ static bool decode_distance(
     *out_distance = distance;
     return true;
 }
+#endif
+
+static bool encode_length_static(
+    LzssArithmeticCodec *codec,
+    struct ac *ac,
+    struct bio *ac_bio,
+    struct bio *extra_bio,
+    uint32_t length)
+{
+    size_t length_symbol = 0;
+    const DeflateClass *length_class = nullptr;
+
+    if (!find_class_for_value(
+            LENGTH_CLASSES,
+            array_count(LENGTH_CLASSES),
+            static_cast<uint32_t>(codec->config.min_match_length),
+            static_cast<uint32_t>(codec->config.max_match_length),
+            length,
+            &length_symbol,
+            &length_class)) {
+        return false;
+    }
+
+    ac_encode_symbol_model(
+        ac,
+        ac_bio,
+        length_symbol,
+        &codec->length_model
+    );
+
+    ac_encode_bypass_bits(
+        extra_bio,
+        length - length_class->base,
+        length_class->extra_bits
+    );
+
+    return true;
+}
+
+static bool decode_length_static(
+    LzssArithmeticCodec *codec,
+    struct ac *ac,
+    struct bio *ac_bio,
+    struct bio *extra_bio,
+    uint32_t *out_length)
+{
+    if (codec->length_model.total == 0) {
+        return false;
+    }
+
+    const size_t length_symbol =
+        ac_decode_symbol_model(
+            ac,
+            ac_bio,
+            &codec->length_model
+        );
+
+    if (length_symbol >= codec->length_model.count) {
+        return false;
+    }
+
+    const DeflateClass *length_class = nullptr;
+
+    if (!find_class_by_symbol(
+            LENGTH_CLASSES,
+            array_count(LENGTH_CLASSES),
+            static_cast<uint32_t>(codec->config.min_match_length),
+            static_cast<uint32_t>(codec->config.max_match_length),
+            length_symbol,
+            &length_class)) {
+        return false;
+    }
+
+    const uint32_t extra_value =
+        ac_decode_bypass_bits(extra_bio, length_class->extra_bits);
+
+    if (extra_value >= length_class->size) {
+        return false;
+    }
+
+    const uint32_t length =
+        length_class->base + extra_value;
+
+    if (length < codec->config.min_match_length ||
+        length > codec->config.max_match_length) {
+        return false;
+    }
+
+    *out_length = length;
+    return true;
+}
+
+static bool encode_distance_static(
+    LzssArithmeticCodec *codec,
+    struct ac *ac,
+    struct bio *ac_bio,
+    struct bio *extra_bio,
+    uint32_t distance)
+{
+    size_t distance_symbol = 0;
+    const DeflateClass *distance_class = nullptr;
+
+    if (!find_class_for_value(
+            DISTANCE_CLASSES,
+            array_count(DISTANCE_CLASSES),
+            1,
+            static_cast<uint32_t>(codec->config.window_size),
+            distance,
+            &distance_symbol,
+            &distance_class)) {
+        return false;
+    }
+
+    ac_encode_symbol_model(
+        ac,
+        ac_bio,
+        distance_symbol,
+        &codec->distance_model
+    );
+
+    ac_encode_bypass_bits(
+        extra_bio,
+        distance - distance_class->base,
+        distance_class->extra_bits
+    );
+
+    return true;
+}
+
+static bool decode_distance_static(
+    LzssArithmeticCodec *codec,
+    struct ac *ac,
+    struct bio *ac_bio,
+    struct bio *extra_bio,
+    uint32_t *out_distance)
+{
+    if (codec->distance_model.total == 0) {
+        return false;
+    }
+
+    const size_t distance_symbol =
+        ac_decode_symbol_model(
+            ac,
+            ac_bio,
+            &codec->distance_model
+        );
+
+    if (distance_symbol >= codec->distance_model.count) {
+        return false;
+    }
+
+    const DeflateClass *distance_class = nullptr;
+
+    if (!find_class_by_symbol(
+            DISTANCE_CLASSES,
+            array_count(DISTANCE_CLASSES),
+            1,
+            static_cast<uint32_t>(codec->config.window_size),
+            distance_symbol,
+            &distance_class)) {
+        return false;
+    }
+
+    const uint32_t extra_value =
+        ac_decode_bypass_bits(extra_bio, distance_class->extra_bits);
+
+    if (extra_value >= distance_class->size) {
+        return false;
+    }
+
+    const uint32_t distance =
+        distance_class->base + extra_value;
+
+    if (distance == 0 || distance > codec->config.window_size) {
+        return false;
+    }
+
+    *out_distance = distance;
+    return true;
+}
 
 bool lzss_ac_codec_init(
     LzssArithmeticCodec *codec,
@@ -618,6 +998,36 @@ bool lzss_ac_encode_stream(
         return false;
     }
 
+    if (!collect_static_model_stats(codec, stream) ||
+        !write_static_model_header(bio, codec)) {
+        return false;
+    }
+
+    const size_t ac_word_capacity =
+        std::max<size_t>(1024, stream->count * 8 + 64);
+    const size_t extra_word_capacity =
+        std::max<size_t>(16, stream->count + 64);
+
+    std::vector<uint32_t> ac_words(ac_word_capacity, 0);
+    std::vector<uint32_t> extra_words(extra_word_capacity, 0);
+
+    struct bio ac_writer{};
+    struct bio extra_writer{};
+
+    bio_open(
+        &ac_writer,
+        ac_words.data(),
+        ac_words.data() + ac_words.size(),
+        BIO_MODE_WRITE
+    );
+
+    bio_open(
+        &extra_writer,
+        extra_words.data(),
+        extra_words.data() + extra_words.size(),
+        BIO_MODE_WRITE
+    );
+
     ac_init(ac);
 
     bool eof_seen = false;
@@ -640,44 +1050,46 @@ bool lzss_ac_encode_stream(
 
         ac_encode_symbol_model(
             ac,
-            bio,
+            &ac_writer,
             token->type,
             &codec->event_model
         );
 
-        model_update(
-            &codec->event_model,
-            token->type
-        );
+        /*
+         * Adaptive version:
+         * model_update(&codec->event_model, token->type);
+         */
 
         switch (token->type) {
         case LZSS_TOKEN_LITERAL:
             ac_encode_symbol_model(
                 ac,
-                bio,
+                &ac_writer,
                 token->literal,
                 &codec->literal_model
             );
 
-            model_update(
-                &codec->literal_model,
-                token->literal
-            );
+            /*
+             * Adaptive version:
+             * model_update(&codec->literal_model, token->literal);
+             */
             break;
 
         case LZSS_TOKEN_MATCH: {
-            if (!encode_length(
+            if (!encode_length_static(
                     codec,
                     ac,
-                    bio,
+                    &ac_writer,
+                    &extra_writer,
                     token->match.length)) {
                 return false;
             }
 
-            if (!encode_distance(
+            if (!encode_distance_static(
                     codec,
                     ac,
-                    bio,
+                    &ac_writer,
+                    &extra_writer,
                     token->match.distance)) {
                 return false;
             }
@@ -697,7 +1109,33 @@ bool lzss_ac_encode_stream(
         return false;
     }
 
-    ac_encode_flush(ac, bio);
+    ac_encode_flush(ac, &ac_writer);
+    bio_close(&ac_writer, BIO_MODE_WRITE);
+    bio_close(&extra_writer, BIO_MODE_WRITE);
+
+    const size_t ac_word_count =
+        static_cast<size_t>(ac_writer.ptr - ac_words.data());
+    const size_t extra_word_count =
+        static_cast<size_t>(extra_writer.ptr - extra_words.data());
+
+    uint32_t ac_word_count_u32 = 0;
+    uint32_t extra_word_count_u32 = 0;
+
+    if (!checked_size_to_u32(ac_word_count, &ac_word_count_u32) ||
+        !checked_size_to_u32(extra_word_count, &extra_word_count_u32) ||
+        !write_u32(bio, ac_word_count_u32) ||
+        !write_u32(bio, extra_word_count_u32)) {
+        return false;
+    }
+
+    for (size_t i = 0; i < ac_word_count; ++i) {
+        write_u32(bio, ac_words[i]);
+    }
+
+    for (size_t i = 0; i < extra_word_count; ++i) {
+        write_u32(bio, extra_words[i]);
+    }
+
     return true;
 }
 
@@ -714,14 +1152,49 @@ bool lzss_ac_decode_stream(
         return false;
     }
 
+    if (!read_static_model_header(bio, codec)) {
+        return false;
+    }
+
+    const uint32_t ac_word_count = read_u32(bio);
+    const uint32_t extra_word_count = read_u32(bio);
+
+    std::vector<uint32_t> ac_words(ac_word_count, 0);
+    std::vector<uint32_t> extra_words(extra_word_count, 0);
+
+    for (uint32_t i = 0; i < ac_word_count; ++i) {
+        ac_words[i] = read_u32(bio);
+    }
+
+    for (uint32_t i = 0; i < extra_word_count; ++i) {
+        extra_words[i] = read_u32(bio);
+    }
+
+    struct bio ac_reader{};
+    struct bio extra_reader{};
+
+    bio_open(
+        &ac_reader,
+        ac_words.data(),
+        ac_words.data() + ac_words.size(),
+        BIO_MODE_READ
+    );
+
+    bio_open(
+        &extra_reader,
+        extra_words.data(),
+        extra_words.data() + extra_words.size(),
+        BIO_MODE_READ
+    );
+
     ac_init(ac);
-    ac_decode_init(ac, bio);
+    ac_decode_init(ac, &ac_reader);
 
     for (;;) {
         const size_t event =
             ac_decode_symbol_model(
                 ac,
-                bio,
+                &ac_reader,
                 &codec->event_model
             );
 
@@ -729,44 +1202,50 @@ bool lzss_ac_decode_stream(
             return false;
         }
 
-        model_update(
-            &codec->event_model,
-            event
-        );
+        /*
+         * Adaptive version:
+         * model_update(&codec->event_model, event);
+         */
 
         LzssToken token{};
         token.type = (LzssTokenType)event;
 
         switch (token.type) {
         case LZSS_TOKEN_LITERAL:
+            if (codec->literal_model.total == 0) {
+                return false;
+            }
+
             token.literal = (uint8_t)
                 ac_decode_symbol_model(
                     ac,
-                    bio,
+                    &ac_reader,
                     &codec->literal_model
                 );
 
-            model_update(
-                &codec->literal_model,
-                token.literal
-            );
+            /*
+             * Adaptive version:
+             * model_update(&codec->literal_model, token.literal);
+             */
 
             token_stream_push(out_stream, token);
             break;
 
         case LZSS_TOKEN_MATCH: {
-            if (!decode_length(
+            if (!decode_length_static(
                     codec,
                     ac,
-                    bio,
+                    &ac_reader,
+                    &extra_reader,
                     &token.match.length)) {
                 return false;
             }
 
-            if (!decode_distance(
+            if (!decode_distance_static(
                     codec,
                     ac,
-                    bio,
+                    &ac_reader,
+                    &extra_reader,
                     &token.match.distance)) {
                 return false;
             }

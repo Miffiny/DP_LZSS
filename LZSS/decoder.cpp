@@ -55,19 +55,50 @@ bool buffer_append(ByteBuffer *buffer, const uint8_t *src, size_t length) {
     return true;
 }
 
+static uint64_t load64(const uint8_t *src)
+{
+    uint64_t value;
+    memcpy(&value, src, sizeof(value));
+    return value;
+}
+
+static void store64(uint8_t *dst, uint64_t value)
+{
+    memcpy(dst, &value, sizeof(value));
+}
+
 bool buffer_copy_match(ByteBuffer *buffer, uint32_t distance, uint32_t length) {
     // quick checks
     if (distance == 0 || distance > buffer->size) return false;
     if (!buffer_ensure_capacity(buffer, length)) return false;
 
     // Find start of match
-    size_t start_pos = buffer->size - distance;
+    const size_t start_pos = buffer->size - distance;
+    const size_t dst_pos = buffer->size;
+    size_t copied = 0;
 
-    for (uint32_t i = 0; i < length; i++) {
-        buffer->data[buffer->size] = buffer->data[start_pos + i];
-        buffer->size++;
+    if (distance >= length) {
+        memcpy(buffer->data + dst_pos, buffer->data + start_pos, length);
+        buffer->size += length;
+        return true;
     }
 
+    if (distance >= sizeof(uint64_t)) {
+        while (copied + sizeof(uint64_t) <= length) {
+            const uint64_t value =
+                load64(buffer->data + start_pos + copied);
+            store64(buffer->data + dst_pos + copied, value);
+            copied += sizeof(uint64_t);
+        }
+    }
+
+    while (copied < length) {
+        buffer->data[dst_pos + copied] =
+            buffer->data[start_pos + copied];
+        ++copied;
+    }
+
+    buffer->size += length;
     return true;
 }
 

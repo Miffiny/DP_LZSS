@@ -46,6 +46,13 @@ static uint32_t load32(const uint8_t *buffer, size_t pos)
     return value;
 }
 
+static uint64_t load64(const uint8_t *buffer, size_t pos)
+{
+    uint64_t value;
+    std::memcpy(&value, buffer + pos, sizeof(value));
+    return value;
+}
+
 static size_t hash4(const uint8_t *buffer, size_t pos)
 {
     uint32_t value = load32(buffer, pos);
@@ -54,6 +61,26 @@ static size_t hash4(const uint8_t *buffer, size_t pos)
     value *= 0x9e3779b1u;
     value ^= value >> 16;
     return value & (HASH_SIZE - 1);
+}
+
+static size_t count_match_length(const uint8_t *buffer,
+                                 size_t left,
+                                 size_t right,
+                                 size_t start_len,
+                                 size_t max_len)
+{
+    size_t len = start_len;
+
+    while (len + sizeof(uint64_t) <= max_len &&
+           load64(buffer, left + len) == load64(buffer, right + len)) {
+        len += sizeof(uint64_t);
+    }
+
+    while (len < max_len && buffer[left + len] == buffer[right + len]) {
+        ++len;
+    }
+
+    return len;
 }
 
 LzssMatchFinder* match_finder_create(size_t window_size) {
@@ -140,12 +167,8 @@ bool match_finder_get_best(LzssMatchFinder* mf, const uint8_t* buffer,
             continue;
         }
 
-        size_t current_len = HASH_BYTES;
-
-        while (current_len < max_len &&
-               buffer[search_pos + current_len] == buffer[pos + current_len]) {
-            current_len++;
-        }
+        const size_t current_len =
+            count_match_length(buffer, search_pos, pos, HASH_BYTES, max_len);
 
         if (current_len >= min_len && current_len > best_len) {
             best_len = current_len;

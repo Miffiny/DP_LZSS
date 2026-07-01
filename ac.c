@@ -99,6 +99,10 @@ void ac_encode(struct ac *ac, struct bio *bio, size_t low_freq, size_t high_freq
 
 size_t index_of_symbol(size_t symb, struct symbol *model, size_t symbols)
 {
+	if (symb < symbols && model[symb].symb == symb) {
+		return symb;
+	}
+
 	for (size_t i = 0; i < symbols; i++) {
 		if (symb == model[i].symb) {
 			return i;
@@ -210,12 +214,26 @@ void ac_decode_scale(struct ac *ac, struct bio *bio)
 
 size_t index_of_value(size_t value, struct symbol *model, size_t symbols)
 {
-	for (size_t i = 0; i < symbols; i++) {
-		size_t low_freq  = model[i].cum_freq;
-		size_t high_freq = model[i].cum_freq + model[i].freq;
+	size_t lo = 0;
+	size_t hi = symbols;
+
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		size_t high_freq = model[mid].cum_freq + model[mid].freq;
+
+		if (value < high_freq) {
+			hi = mid;
+		} else {
+			lo = mid + 1;
+		}
+	}
+
+	if (lo < symbols) {
+		size_t low_freq  = model[lo].cum_freq;
+		size_t high_freq = low_freq + model[lo].freq;
 
 		if (value >= low_freq && value < high_freq) {
-			return i;
+			return lo;
 		}
 	}
 
