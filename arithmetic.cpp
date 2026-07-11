@@ -248,33 +248,6 @@ static bool token_is_valid(
     }
 }
 
-#if 0
-// Adaptive extra-bit and length/distance coding.
-static void encode_extra_bits(
-    struct ac *ac,
-    struct bio *bio,
-    struct model *bit_models,
-    size_t bit_count,
-    uint32_t value)
-{
-    for (size_t bit_index = 0;
-         bit_index < bit_count;
-         ++bit_index) {
-        const size_t shift =
-            bit_count - 1 - bit_index;
-
-        const size_t bit =
-            (value >> shift) & 1u;
-
-        model *model =
-            &bit_models[bit_index];
-
-        ac_encode_symbol_model(ac, bio, bit, model);
-        model_update(model, bit);
-    }
-}
-#endif
-
 static bool write_u32(struct bio *bio, uint32_t value)
 {
     ac_encode_bypass_bits(bio, value, 32);
@@ -467,247 +440,6 @@ static bool collect_static_model_stats(
            model_set_frequencies(&codec->length_model, length_frequencies) &&
            model_set_frequencies(&codec->distance_model, distance_frequencies);
 }
-
-#if 0
-// Adaptive decode/update path
-static bool decode_extra_bits(
-    struct ac *ac,
-    struct bio *bio,
-    struct model *bit_models,
-    size_t bit_count,
-    uint32_t *out_value)
-{
-    uint32_t value = 0;
-
-    for (size_t bit_index = 0;
-         bit_index < bit_count;
-         ++bit_index) {
-        struct model *model =
-            &bit_models[bit_index];
-
-        const size_t bit =
-            ac_decode_symbol_model(ac, bio, model);
-
-        if (bit > 1) {
-            return false;
-        }
-
-        model_update(model, bit);
-
-        value = (value << 1) | static_cast<uint32_t>(bit);
-    }
-
-    *out_value = value;
-    return true;
-}
-
-static bool encode_length(
-    LzssArithmeticCodec *codec,
-    struct ac *ac,
-    struct bio *bio,
-    uint32_t length)
-{
-    size_t length_symbol = 0;
-    const DeflateClass *length_class = nullptr;
-
-    if (!find_class_for_value(
-            LENGTH_CLASSES,
-            array_count(LENGTH_CLASSES),
-            static_cast<uint32_t>(codec->config.min_match_length),
-            static_cast<uint32_t>(codec->config.max_match_length),
-            length,
-            &length_symbol,
-            &length_class)) {
-        return false;
-    }
-
-    ac_encode_symbol_model(
-        ac,
-        bio,
-        length_symbol,
-        &codec->length_model
-    );
-
-    model_update(
-        &codec->length_model,
-        length_symbol
-    );
-
-    encode_extra_bits(
-        ac,
-        bio,
-        codec->length_extra_bit_models,
-        length_class->extra_bits,
-        length - length_class->base
-    );
-
-    return true;
-}
-
-static bool decode_length(
-    LzssArithmeticCodec *codec,
-    struct ac *ac,
-    struct bio *bio,
-    uint32_t *out_length)
-{
-    const size_t length_symbol =
-        ac_decode_symbol_model(
-            ac,
-            bio,
-            &codec->length_model
-        );
-
-    if (length_symbol >= codec->length_model.count) {
-        return false;
-    }
-
-    model_update(
-        &codec->length_model,
-        length_symbol
-    );
-
-    const DeflateClass *length_class = nullptr;
-
-    if (!find_class_by_symbol(
-            LENGTH_CLASSES,
-            array_count(LENGTH_CLASSES),
-            static_cast<uint32_t>(codec->config.min_match_length),
-            static_cast<uint32_t>(codec->config.max_match_length),
-            length_symbol,
-            &length_class)) {
-        return false;
-    }
-
-    uint32_t extra_value = 0;
-
-    if (!decode_extra_bits(
-            ac,
-            bio,
-            codec->length_extra_bit_models,
-            length_class->extra_bits,
-            &extra_value)) {
-        return false;
-    }
-
-    if (extra_value >= length_class->size) {
-        return false;
-    }
-
-    const uint32_t length =
-        length_class->base + extra_value;
-
-    if (length < codec->config.min_match_length ||
-        length > codec->config.max_match_length) {
-        return false;
-    }
-
-    *out_length = length;
-    return true;
-}
-
-static bool encode_distance(
-    LzssArithmeticCodec *codec,
-    struct ac *ac,
-    struct bio *bio,
-    uint32_t distance)
-{
-    size_t distance_symbol = 0;
-    const DeflateClass *distance_class = nullptr;
-
-    if (!find_class_for_value(
-            DISTANCE_CLASSES,
-            array_count(DISTANCE_CLASSES),
-            1,
-            static_cast<uint32_t>(codec->config.window_size),
-            distance,
-            &distance_symbol,
-            &distance_class)) {
-        return false;
-    }
-
-    ac_encode_symbol_model(
-        ac,
-        bio,
-        distance_symbol,
-        &codec->distance_model
-    );
-
-    model_update(
-        &codec->distance_model,
-        distance_symbol
-    );
-
-    encode_extra_bits(
-        ac,
-        bio,
-        codec->distance_extra_bit_models,
-        distance_class->extra_bits,
-        distance - distance_class->base
-    );
-
-    return true;
-}
-
-static bool decode_distance(
-    LzssArithmeticCodec *codec,
-    struct ac *ac,
-    struct bio *bio,
-    uint32_t *out_distance)
-{
-    const size_t distance_symbol =
-        ac_decode_symbol_model(
-            ac,
-            bio,
-            &codec->distance_model
-        );
-
-    if (distance_symbol >= codec->distance_model.count) {
-        return false;
-    }
-
-    model_update(
-        &codec->distance_model,
-        distance_symbol
-    );
-
-    const DeflateClass *distance_class = nullptr;
-
-    if (!find_class_by_symbol(
-            DISTANCE_CLASSES,
-            array_count(DISTANCE_CLASSES),
-            1,
-            static_cast<uint32_t>(codec->config.window_size),
-            distance_symbol,
-            &distance_class)) {
-        return false;
-    }
-
-    uint32_t extra_value = 0;
-
-    if (!decode_extra_bits(
-            ac,
-            bio,
-            codec->distance_extra_bit_models,
-            distance_class->extra_bits,
-            &extra_value)) {
-        return false;
-    }
-
-    if (extra_value >= distance_class->size) {
-        return false;
-    }
-
-    const uint32_t distance =
-        distance_class->base + extra_value;
-
-    if (distance == 0 || distance > codec->config.window_size) {
-        return false;
-    }
-
-    *out_distance = distance;
-    return true;
-}
-#endif
 
 static bool encode_length_static(
     LzssArithmeticCodec *codec,
@@ -1055,11 +787,6 @@ bool lzss_ac_encode_stream(
             &codec->event_model
         );
 
-        /*
-         * Adaptive version:
-         * model_update(&codec->event_model, token->type);
-         */
-
         switch (token->type) {
         case LZSS_TOKEN_LITERAL:
             ac_encode_symbol_model(
@@ -1069,10 +796,6 @@ bool lzss_ac_encode_stream(
                 &codec->literal_model
             );
 
-            /*
-             * Adaptive version:
-             * model_update(&codec->literal_model, token->literal);
-             */
             break;
 
         case LZSS_TOKEN_MATCH: {
@@ -1202,11 +925,6 @@ bool lzss_ac_decode_stream(
             return false;
         }
 
-        /*
-         * Adaptive version:
-         * model_update(&codec->event_model, event);
-         */
-
         LzssToken token{};
         token.type = (LzssTokenType)event;
 
@@ -1222,11 +940,6 @@ bool lzss_ac_decode_stream(
                     &ac_reader,
                     &codec->literal_model
                 );
-
-            /*
-             * Adaptive version:
-             * model_update(&codec->literal_model, token.literal);
-             */
 
             token_stream_push(out_stream, token);
             break;
