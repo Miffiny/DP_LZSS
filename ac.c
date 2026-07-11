@@ -280,13 +280,42 @@ float ac_encode_symbol_model_query_prob(size_t symb, struct model *model)
 
 size_t ac_decode_symbol_model(struct ac *ac, struct bio *bio, struct model *model)
 {
-	return ac_decode_symbol(ac, bio, model->table, model->count, model->total);
+	const size_t value = ac_decode_target(ac, model->total);
+	size_t index;
+
+	if (model->decode_lut != NULL &&
+		model->decode_lut_size == model->total) {
+		index = model->decode_lut[value];
+	} else {
+		index = index_of_value(value, model->table, model->count);
+	}
+
+	const size_t low_freq  = model->table[index].cum_freq;
+	const size_t high_freq = low_freq + model->table[index].freq;
+
+	const uint64_t range =
+		(uint64_t)ac->mHigh - ac->mLow + 1;
+
+	const uint64_t new_low =
+		range * low_freq / model->total;
+
+	const uint64_t new_high =
+		range * high_freq / model->total;
+
+	ac->mLow += (uint32_t)new_low;
+	ac->mHigh =
+		ac->mLow + (uint32_t)(new_high - new_low) - 1;
+
+	ac_decode_scale(ac, bio);
+
+	return model->table[index].symb;
 }
 
 void inc_model(struct model *model, size_t symbol)
 {
 	size_t index = index_of_symbol(symbol, model->table, model->count);
 
+	model_clear_decode_lut(model);
 	model->table[index].freq++;
 	model->total++;
 
@@ -298,7 +327,10 @@ void model_create(struct model *model, size_t size)
 	assert(model != NULL);
 
 	model->count = size;
+	model->total = 0;
 	model->table = malloc(model->count * sizeof(struct symbol));
+	model->decode_lut_size = 0;
+	model->decode_lut = NULL;
 
 	if (model->table == NULL) {
 		abort();
@@ -317,6 +349,7 @@ void model_enlarge(struct model *model)
 {
 	assert(model != NULL);
 
+	model_clear_decode_lut(model);
 	model->count++;
 	model->table = realloc(model->table, model->count * sizeof(struct symbol));
 
@@ -335,7 +368,53 @@ void model_destroy(struct model *model)
 {
 	assert(model != NULL);
 
+	model_clear_decode_lut(model);
 	free(model->table);
+}
+
+void model_clear_decode_lut(struct model *model)
+{
+	if (model == NULL) {
+		return;
+	}
+
+	free(model->decode_lut);
+	model->decode_lut = NULL;
+	model->decode_lut_size = 0;
+}
+
+int model_build_decode_lut(struct model *model, size_t max_total)
+{
+	if (model == NULL || model->table == NULL ||
+		model->total == 0 || model->total > max_total ||
+		model->count > UINT16_MAX) {
+		model_clear_decode_lut(model);
+		return model != NULL && model->total == 0;
+	}
+
+	model_clear_decode_lut(model);
+
+	model->decode_lut = malloc(model->total * sizeof(model->decode_lut[0]));
+	if (model->decode_lut == NULL) {
+		return 0;
+	}
+
+	model->decode_lut_size = model->total;
+
+	for (size_t i = 0; i < model->count; ++i) {
+		const size_t low = model->table[i].cum_freq;
+		const size_t high = low + model->table[i].freq;
+
+		if (model->table[i].freq == 0) {
+			continue;
+		}
+
+		for (size_t value = low; value < high; ++value) {
+			model->decode_lut[value] = (uint16_t)i;
+		}
+	}
+
+	return 1;
 }
 
 enum {
@@ -344,6 +423,8 @@ enum {
 
 void model_rescale(struct model *model)
 {
+	model_clear_decode_lut(model);
+
 	for (size_t i = 0; i < model->count; ++i) {
 		model->table[i].freq =
 			(model->table[i].freq + 1) / 2;
@@ -364,6 +445,8 @@ void model_update(struct model *model, size_t symbol)
 
 	model->table[index].freq++;
 	model->total++;
+
+	model_clear_decode_lut(model);
 
 	if (model->total >= MODEL_MAX_TOTAL) {
 		model_rescale(model);

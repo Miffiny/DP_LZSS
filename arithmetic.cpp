@@ -6,6 +6,8 @@
 #include <limits>
 #include <vector>
 
+static constexpr size_t STATIC_MODEL_MAX_TOTAL = 1u << 12;
+
 struct DeflateClass {
     uint32_t base;
     uint32_t size;
@@ -279,23 +281,109 @@ static bool model_set_frequencies(
         return false;
     }
 
+    std::vector<uint32_t> scaled_frequencies = frequencies;
     size_t total = 0;
 
-    for (size_t i = 0; i < model->count; ++i) {
-        model->table[i].symb = i;
-        model->table[i].freq = frequencies[i];
-
+    for (uint32_t frequency : scaled_frequencies) {
         if (total > std::numeric_limits<size_t>::max() -
-                        static_cast<size_t>(frequencies[i])) {
+                        static_cast<size_t>(frequency)) {
             return false;
         }
 
-        total += frequencies[i];
+        total += frequency;
+    }
+
+    if (total > STATIC_MODEL_MAX_TOTAL) {
+        size_t positive_count = 0;
+        for (uint32_t frequency : scaled_frequencies) {
+            if (frequency != 0) {
+                ++positive_count;
+            }
+        }
+
+        if (positive_count > STATIC_MODEL_MAX_TOTAL) {
+            return false;
+        }
+
+        std::vector<uint64_t> remainders(model->count, 0);
+        size_t scaled_total = 0;
+
+        for (size_t i = 0; i < model->count; ++i) {
+            if (scaled_frequencies[i] == 0) {
+                continue;
+            }
+
+            const uint64_t product =
+                static_cast<uint64_t>(scaled_frequencies[i]) *
+                static_cast<uint64_t>(STATIC_MODEL_MAX_TOTAL);
+            uint32_t scaled =
+                static_cast<uint32_t>(product / total);
+
+            if (scaled == 0) {
+                scaled = 1;
+            }
+
+            scaled_frequencies[i] = scaled;
+            remainders[i] = product % total;
+            scaled_total += scaled;
+        }
+
+        while (scaled_total > STATIC_MODEL_MAX_TOTAL) {
+            size_t reduce_index = model->count;
+
+            for (size_t i = 0; i < model->count; ++i) {
+                if (scaled_frequencies[i] <= 1) {
+                    continue;
+                }
+
+                if (reduce_index == model->count ||
+                    scaled_frequencies[i] > scaled_frequencies[reduce_index]) {
+                    reduce_index = i;
+                }
+            }
+
+            if (reduce_index == model->count) {
+                return false;
+            }
+
+            --scaled_frequencies[reduce_index];
+            --scaled_total;
+        }
+
+        while (scaled_total < STATIC_MODEL_MAX_TOTAL) {
+            size_t increase_index = model->count;
+
+            for (size_t i = 0; i < model->count; ++i) {
+                if (scaled_frequencies[i] == 0) {
+                    continue;
+                }
+
+                if (increase_index == model->count ||
+                    remainders[i] > remainders[increase_index]) {
+                    increase_index = i;
+                }
+            }
+
+            if (increase_index == model->count) {
+                return false;
+            }
+
+            ++scaled_frequencies[increase_index];
+            ++scaled_total;
+            remainders[increase_index] = 0;
+        }
+
+        total = scaled_total;
+    }
+
+    for (size_t i = 0; i < model->count; ++i) {
+        model->table[i].symb = i;
+        model->table[i].freq = scaled_frequencies[i];
     }
 
     count_cum_freqs(model->table, model->count);
     model->total = total;
-    return true;
+    return model_build_decode_lut(model, STATIC_MODEL_MAX_TOTAL) != 0;
 }
 
 static bool write_model_frequencies(struct bio *bio, const struct model *model)

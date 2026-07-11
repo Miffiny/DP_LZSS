@@ -40,6 +40,8 @@ struct model {
 	size_t count;
 	size_t total;
 	struct symbol *table; /* count entries */
+	size_t decode_lut_size;
+	uint16_t *decode_lut;
 };
 
 void ac_encode_bypass_bits(
@@ -61,6 +63,8 @@ void inc_model(struct model *model, size_t symbol);
 void model_create(struct model *model, size_t size);
 void model_enlarge(struct model *model);
 void model_destroy(struct model *model);
+void model_clear_decode_lut(struct model *model);
+int model_build_decode_lut(struct model *model, size_t max_total);
 
 void model_rescale(struct model *model);
 void model_update(struct model *model, size_t symbol);
