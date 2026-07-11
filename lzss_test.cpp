@@ -112,10 +112,42 @@ static bool run_arithmetic_roundtrip(const LzssTokenStream& stream,
 struct CompressionResult {
     bool ok;
     size_t token_count;
+    size_t match_token_count;
+    size_t literal_token_count;
+    size_t match_memory;
+    size_t match_length_total;
     size_t compressed_size;
     double compress_ms;
     double decompress_ms;
 };
+
+static void collect_token_stats(
+    const LzssTokenStream& stream,
+    CompressionResult *result)
+{
+    result->token_count = stream.count;
+
+    for (size_t i = 0; i < stream.count; ++i) {
+        const LzssToken& token = stream.tokens[i];
+
+        switch (token.type) {
+        case LZSS_TOKEN_LITERAL:
+            result->literal_token_count++;
+            break;
+
+        case LZSS_TOKEN_MATCH:
+            result->match_token_count++;
+            result->match_memory +=
+                sizeof(token.match.distance) +
+                sizeof(token.match.length);
+            result->match_length_total += token.match.length;
+            break;
+
+        case LZSS_TOKEN_EOF:
+            break;
+        }
+    }
+}
 
 static std::vector<uint8_t> read_file(const std::filesystem::path& path)
 {
@@ -195,7 +227,7 @@ static CompressionResult compress_decompress_file(
         lzss_ac_codec_destroy(&encoder_codec);
     }
 
-    result.token_count = stream.count;
+    collect_token_stats(stream, &result);
     result.compressed_size =
         static_cast<size_t>(writer.ptr - compressed.data()) *
         sizeof(uint32_t);
@@ -387,11 +419,20 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
         << std::setw(14) << "comp ms"
         << std::setw(14) << "decomp ms"
         << std::setw(12) << "tokens"
+        << std::setw(12) << "matches"
+        << std::setw(12) << "literals"
+        << std::setw(13) << "match mem"
+        << std::setw(12) << "avg match"
         << '\n';
 
     bool all_ok = true;
     size_t total_input = 0;
     size_t total_compressed = 0;
+    size_t total_tokens = 0;
+    size_t total_match_tokens = 0;
+    size_t total_literal_tokens = 0;
+    size_t total_match_memory = 0;
+    size_t total_match_length = 0;
     double total_compress_ms = 0.0;
     double total_decompress_ms = 0.0;
 
@@ -411,6 +452,10 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
             ? 0.0
             : static_cast<double>(input.size()) /
               static_cast<double>(result.compressed_size);
+        const double avg_match_length = result.match_token_count == 0
+            ? 0.0
+            : static_cast<double>(result.match_length_total) /
+              static_cast<double>(result.match_token_count);
 
         out << std::left << std::setw(14) << path.filename().string()
             << std::right << std::setw(13) << input.size()
@@ -421,12 +466,22 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
             << std::setw(14) << std::fixed << std::setprecision(0)
             << result.decompress_ms
             << std::setw(12) << result.token_count
+            << std::setw(12) << result.match_token_count
+            << std::setw(12) << result.literal_token_count
+            << std::setw(13) << result.match_memory
+            << std::setw(12) << std::fixed << std::setprecision(2)
+            << avg_match_length
             << (result.ok ? "" : "  FAIL")
             << '\n';
 
         all_ok = result.ok && all_ok;
         total_input += input.size();
         total_compressed += result.compressed_size;
+        total_tokens += result.token_count;
+        total_match_tokens += result.match_token_count;
+        total_literal_tokens += result.literal_token_count;
+        total_match_memory += result.match_memory;
+        total_match_length += result.match_length_total;
         total_compress_ms += result.compress_ms;
         total_decompress_ms += result.decompress_ms;
     }
@@ -435,6 +490,10 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
         ? 0.0
         : static_cast<double>(total_input) /
           static_cast<double>(total_compressed);
+    const double total_avg_match_length = total_match_tokens == 0
+        ? 0.0
+        : static_cast<double>(total_match_length) /
+          static_cast<double>(total_match_tokens);
 
     out << '\n'
         << std::left << std::setw(14) << "TOTAL"
@@ -446,6 +505,12 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
         << total_compress_ms
         << std::setw(14) << std::fixed << std::setprecision(2)
         << total_decompress_ms
+        << std::setw(12) << total_tokens
+        << std::setw(12) << total_match_tokens
+        << std::setw(12) << total_literal_tokens
+        << std::setw(13) << total_match_memory
+        << std::setw(12) << std::fixed << std::setprecision(2)
+        << total_avg_match_length
         << '\n';
 
     out << (all_ok ? "OK, all checks passed\n"
