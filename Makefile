@@ -11,7 +11,7 @@ CC := gcc
 
 CXXFLAGS := -std=c++17 -Wall -Wextra -O2
 CFLAGS := -std=c11 -Wall -Wextra -O2
-CPPFLAGS := -I. -ILZSS
+CPPFLAGS := -I. -ILZSS -DLZSS_DEFAULT_ENTROPY_CODEC=LZSS_ENTROPY_CODEC_TANS
 
 CPP_SRCS := $(wildcard *.cpp) $(wildcard LZSS/*.cpp)
 C_SRCS := $(wildcard *.c)

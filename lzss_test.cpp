@@ -3,6 +3,7 @@
 #include "LZSS/decoder.h"
 #include "LZSS/parser.h"
 #include "arithmetic.h"
+#include "tans.h"
 
 #include <algorithm>
 #include <chrono>
@@ -15,10 +16,14 @@
 #include <utility>
 #include <vector>
 
-static bool run_arithmetic_roundtrip(const LzssTokenStream& stream,
-                                     const std::vector<uint8_t>& input,
-                                     const LzssConfig& config,
-                                     std::ostream& err)
+#define LZSS_ENTROPY_CODEC_ARITHMETIC 1
+#define LZSS_ENTROPY_CODEC_TANS 2
+
+[[maybe_unused]] static bool run_arithmetic_roundtrip(
+    const LzssTokenStream& stream,
+    const std::vector<uint8_t>& input,
+    const LzssConfig& config,
+    std::ostream& err)
 {
     LzssArithmeticCodec encoder_codec{};
     LzssArithmeticCodec decoder_codec{};
@@ -30,7 +35,7 @@ static bool run_arithmetic_roundtrip(const LzssTokenStream& stream,
 
     const size_t word_count = std::max<size_t>(
         1024,
-        stream.count * 8 + input.size() + 64
+        stream.tokens.size() * 8 + input.size() + 64
     );
     std::vector<uint32_t> compressed(word_count, 0);
 
@@ -109,6 +114,123 @@ static bool run_arithmetic_roundtrip(const LzssTokenStream& stream,
     return decoded_tokens && decoded_lzss && same_data;
 }
 
+[[maybe_unused]] static bool run_tans_roundtrip(
+    const LzssTokenStream& stream,
+    const std::vector<uint8_t>& input,
+    const LzssConfig& config,
+    std::ostream& err)
+{
+    LzssTansCodec encoder_codec{};
+    LzssTansCodec decoder_codec{};
+
+    if (!lzss_tans_codec_init(&encoder_codec, &config)) {
+        err << "  tANS encoder codec init failed\n";
+        return false;
+    }
+
+    const size_t word_count = std::max<size_t>(
+        1024,
+        stream.tokens.size() * 8 + input.size() + 64
+    );
+    std::vector<uint32_t> compressed(word_count, 0);
+
+    bio writer{};
+    bio_open(
+        &writer,
+        compressed.data(),
+        compressed.data() + compressed.size(),
+        BIO_MODE_WRITE
+    );
+
+    const bool encoded = lzss_tans_encode_stream(
+        &encoder_codec,
+        &writer,
+        &stream
+    );
+    bio_close(&writer, BIO_MODE_WRITE);
+
+    lzss_tans_codec_destroy(&encoder_codec);
+
+    if (!encoded) {
+        err << "  tANS encode failed\n";
+        return false;
+    }
+
+    const size_t used_words =
+        static_cast<size_t>(writer.ptr - compressed.data());
+
+    if (!lzss_tans_codec_init(&decoder_codec, &config)) {
+        err << "  tANS decoder codec init failed\n";
+        return false;
+    }
+
+    LzssTokenStream decoded_stream;
+    token_stream_init(&decoded_stream, 0);
+
+    bio reader{};
+    bio_open(
+        &reader,
+        compressed.data(),
+        compressed.data() + used_words,
+        BIO_MODE_READ
+    );
+
+    const bool decoded_tokens = lzss_tans_decode_stream(
+        &decoder_codec,
+        &reader,
+        &decoded_stream
+    );
+
+    lzss_tans_codec_destroy(&decoder_codec);
+
+    ByteBuffer decoded_bytes;
+    buffer_init(&decoded_bytes);
+    buffer_init_with_capacity(&decoded_bytes, input.size());
+
+    const bool decoded_lzss =
+        decoded_tokens && lzss_decode(&decoded_stream, &decoded_bytes);
+    const bool same_size = decoded_bytes.size == input.size();
+    const bool same_data = same_size &&
+        std::equal(input.begin(), input.end(), decoded_bytes.data);
+
+    if (!(decoded_tokens && decoded_lzss && same_data)) {
+        err << "  tANS decoded_tokens=" << decoded_tokens
+            << " decoded_lzss=" << decoded_lzss
+            << " decoded_size=" << decoded_bytes.size
+            << " used_words=" << used_words << '\n';
+    }
+
+    buffer_free(&decoded_bytes);
+    token_stream_free(&decoded_stream);
+    return decoded_tokens && decoded_lzss && same_data;
+}
+
+static bool run_default_entropy_roundtrip(
+    const LzssTokenStream& stream,
+    const std::vector<uint8_t>& input,
+    const LzssConfig& config,
+    std::ostream& err)
+{
+#if LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_TANS
+    return run_tans_roundtrip(stream, input, config, err);
+#elif LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_ARITHMETIC
+    return run_arithmetic_roundtrip(stream, input, config, err);
+#else
+#error Unsupported LZSS_DEFAULT_ENTROPY_CODEC
+#endif
+}
+
+static const char *default_entropy_codec_name()
+{
+#if LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_TANS
+    return "tans";
+#elif LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_ARITHMETIC
+    return "ac";
+#else
+#error Unsupported LZSS_DEFAULT_ENTROPY_CODEC
+#endif
+}
+
 struct CompressionResult {
     bool ok;
     size_t token_count;
@@ -125,9 +247,9 @@ static void collect_token_stats(
     const LzssTokenStream& stream,
     CompressionResult *result)
 {
-    result->token_count = stream.count;
+    result->token_count = stream.tokens.size();
 
-    for (size_t i = 0; i < stream.count; ++i) {
+    for (size_t i = 0; i < stream.tokens.size(); ++i) {
         const LzssToken& token = stream.tokens[i];
 
         switch (token.type) {
@@ -185,23 +307,35 @@ static CompressionResult compress_decompress_file(
     LzssTokenStream stream;
     token_stream_init(&stream, 0);
 
-    LzssArithmeticCodec encoder_codec{};
-    LzssArithmeticCodec decoder_codec{};
+#if LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_TANS
+    LzssTansCodec tans_encoder_codec{};
+    LzssTansCodec tans_decoder_codec{};
+#elif LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_ARITHMETIC
+    LzssArithmeticCodec ac_encoder_codec{};
+    LzssArithmeticCodec ac_decoder_codec{};
+#endif
 
     const auto compress_start = std::chrono::steady_clock::now();
 
     bool ok = lzss_encode(input.data(), input.size(), &config, &stream);
+#if LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_TANS
     if (ok) {
-        ok = lzss_ac_codec_init(&encoder_codec, &config);
+        ok = lzss_tans_codec_init(&tans_encoder_codec, &config);
     }
+#elif LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_ARITHMETIC
+    if (ok) {
+        ok = lzss_ac_codec_init(&ac_encoder_codec, &config);
+    }
+#else
+#error Unsupported LZSS_DEFAULT_ENTROPY_CODEC
+#endif
 
     const size_t word_count = std::max<size_t>(
         1024,
-        stream.count * 8 + input.size() + 64
+        stream.tokens.size() * 8 + input.size() + 64
     );
     std::vector<uint32_t> compressed(word_count, 0);
 
-    ac encoder{};
     bio writer{};
 
     if (ok) {
@@ -212,20 +346,35 @@ static CompressionResult compress_decompress_file(
             BIO_MODE_WRITE
         );
 
+#if LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_TANS
+        ok = lzss_tans_encode_stream(
+            &tans_encoder_codec,
+            &writer,
+            &stream
+        );
+#elif LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_ARITHMETIC
+        ac encoder{};
         ok = lzss_ac_encode_stream(
-            &encoder_codec,
+            &ac_encoder_codec,
             &encoder,
             &writer,
             &stream
         );
+#endif
         bio_close(&writer, BIO_MODE_WRITE);
     }
 
     const auto compress_end = std::chrono::steady_clock::now();
 
-    if (encoder_codec.event_model.table != nullptr) {
-        lzss_ac_codec_destroy(&encoder_codec);
+#if LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_TANS
+    if (tans_encoder_codec.event_model.table != nullptr) {
+        lzss_tans_codec_destroy(&tans_encoder_codec);
     }
+#elif LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_ARITHMETIC
+    if (ac_encoder_codec.event_model.table != nullptr) {
+        lzss_ac_codec_destroy(&ac_encoder_codec);
+    }
+#endif
 
     collect_token_stats(stream, &result);
     result.compressed_size =
@@ -244,12 +393,31 @@ static CompressionResult compress_decompress_file(
 
     const auto decompress_start = std::chrono::steady_clock::now();
 
-    ok = lzss_ac_codec_init(&decoder_codec, &config);
+#if LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_TANS
+    ok = lzss_tans_codec_init(&tans_decoder_codec, &config);
+#elif LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_ARITHMETIC
+    ok = lzss_ac_codec_init(&ac_decoder_codec, &config);
+#endif
 
     LzssTokenStream decoded_stream;
     token_stream_init(&decoded_stream, 0);
 
     if (ok) {
+#if LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_TANS
+        bio reader{};
+        bio_open(
+            &reader,
+            compressed.data(),
+            compressed.data() + result.compressed_size / sizeof(uint32_t),
+            BIO_MODE_READ
+        );
+
+        ok = lzss_tans_decode_stream(
+            &tans_decoder_codec,
+            &reader,
+            &decoded_stream
+        );
+#elif LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_ARITHMETIC
         ac decoder{};
         bio reader{};
         bio_open(
@@ -265,6 +433,7 @@ static CompressionResult compress_decompress_file(
             &reader,
             &decoded_stream
         );
+#endif
     }
 
     ByteBuffer decoded_bytes;
@@ -295,9 +464,15 @@ static CompressionResult compress_decompress_file(
 
     buffer_free(&decoded_bytes);
     token_stream_free(&decoded_stream);
-    if (decoder_codec.event_model.table != nullptr) {
-        lzss_ac_codec_destroy(&decoder_codec);
+#if LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_TANS
+    if (tans_decoder_codec.event_model.table != nullptr) {
+        lzss_tans_codec_destroy(&tans_decoder_codec);
     }
+#elif LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_ARITHMETIC
+    if (ac_decoder_codec.event_model.table != nullptr) {
+        lzss_ac_codec_destroy(&ac_decoder_codec);
+    }
+#endif
     token_stream_free(&stream);
 
     return result;
@@ -319,15 +494,16 @@ static bool run_case(const std::string& name, const std::vector<uint8_t>& input,
     const bool same_size = decoded.size == input.size();
     const bool same_data = same_size &&
         std::equal(input.begin(), input.end(), decoded.data);
-    const bool arithmetic_ok = encoded &&
-        run_arithmetic_roundtrip(stream, input, config, err);
+    const bool entropy_ok = encoded &&
+        run_default_entropy_roundtrip(stream, input, config, err);
 
     out << name << ": " << input.size() << " bytes, "
-        << stream.count << " tokens -> "
+        << stream.tokens.size() << " tokens -> "
         << (encoded && decoded_ok && same_data ? "OK" : "FAIL")
-        << ", ac -> " << (arithmetic_ok ? "OK" : "FAIL") << '\n';
+        << ", " << default_entropy_codec_name() << " -> "
+        << (entropy_ok ? "OK" : "FAIL") << '\n';
 
-    if (!(encoded && decoded_ok && same_data && arithmetic_ok)) {
+    if (!(encoded && decoded_ok && same_data && entropy_ok)) {
         err << "  encoded=" << encoded
             << " decoded=" << decoded_ok
             << " decoded_size=" << decoded.size << '\n';
@@ -335,16 +511,15 @@ static bool run_case(const std::string& name, const std::vector<uint8_t>& input,
 
     buffer_free(&decoded);
     token_stream_free(&stream);
-    return encoded && decoded_ok && same_data && arithmetic_ok;
+    return encoded && decoded_ok && same_data && entropy_ok;
 }
 
 bool run_lzss_quickcheck(std::ostream& out, std::ostream& err)
 {
-    const LzssConfig config{
-        65536,
-        4,
-        258,
-        LZSS_PARSE_LAZY
+    const std::vector<std::pair<std::string, LzssParseMode>> parse_modes = {
+        {"greedy", LZSS_PARSE_GREEDY},
+        {"lazy", LZSS_PARSE_LAZY},
+        {"cost_aware", LZSS_PARSE_COST_AWARE},
     };
 
     std::mt19937 rng(0x9f723abc);
@@ -372,8 +547,22 @@ bool run_lzss_quickcheck(std::ostream& out, std::ostream& err)
     }
 
     bool all_ok = true;
-    for (const auto& test : cases) {
-        all_ok = run_case(test.first, test.second, config, out, err) && all_ok;
+    for (const auto& mode : parse_modes) {
+        const LzssConfig config{
+            65536,
+            4,
+            258,
+            mode.second
+        };
+
+        for (const auto& test : cases) {
+            all_ok = run_case(
+                mode.first + "/" + test.first,
+                test.second,
+                config,
+                out,
+                err) && all_ok;
+        }
     }
 
     out << (all_ok ? "OK, all tests passed\n"
@@ -411,6 +600,7 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
     }
 
     out << "Silesia benchmark\n";
+    out << "Entropy codec = " << default_entropy_codec_name() << "\n";
     out << "Compression factor = original_size / compressed_size\n\n";
     out << std::left << std::setw(14) << "file"
         << std::right << std::setw(13) << "input"

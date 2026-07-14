@@ -447,9 +447,7 @@ static bool collect_static_model_stats(
     LzssArithmeticCodec *codec,
     const LzssTokenStream *stream)
 {
-    if (codec == nullptr ||
-        stream == nullptr ||
-        (stream->count > 0 && stream->tokens == nullptr)) {
+    if (codec == nullptr || stream == nullptr) {
         return false;
     }
 
@@ -460,7 +458,9 @@ static bool collect_static_model_stats(
 
     bool eof_seen = false;
 
-    for (size_t i = 0; i < stream->count; ++i) {
+    const size_t token_count = stream->tokens.size();
+
+    for (size_t i = 0; i < token_count; ++i) {
         const LzssToken *token = &stream->tokens[i];
 
         if (!token_is_valid(codec, token) || eof_seen) {
@@ -468,7 +468,7 @@ static bool collect_static_model_stats(
         }
 
         if (token->type == LZSS_TOKEN_EOF &&
-            i + 1 != stream->count) {
+            i + 1 != token_count) {
             return false;
         }
 
@@ -813,8 +813,7 @@ bool lzss_ac_encode_stream(
     if (codec == nullptr ||
         ac == nullptr ||
         bio == nullptr ||
-        stream == nullptr ||
-        (stream->count > 0 && stream->tokens == nullptr)) {
+        stream == nullptr) {
         return false;
     }
 
@@ -823,10 +822,11 @@ bool lzss_ac_encode_stream(
         return false;
     }
 
+    const size_t token_count = stream->tokens.size();
     const size_t ac_word_capacity =
-        std::max<size_t>(1024, stream->count * 8 + 64);
+        std::max<size_t>(1024, token_count * 8 + 64);
     const size_t extra_word_capacity =
-        std::max<size_t>(16, stream->count + 64);
+        std::max<size_t>(16, token_count + 64);
 
     std::vector<uint32_t> ac_words(ac_word_capacity, 0);
     std::vector<uint32_t> extra_words(extra_word_capacity, 0);
@@ -852,7 +852,7 @@ bool lzss_ac_encode_stream(
 
     bool eof_seen = false;
 
-    for (size_t i = 0; i < stream->count; ++i) {
+    for (size_t i = 0; i < token_count; ++i) {
         const LzssToken *token = &stream->tokens[i];
 
         if (!token_is_valid(codec, token)) {
@@ -864,7 +864,7 @@ bool lzss_ac_encode_stream(
         }
 
         if (token->type == LZSS_TOKEN_EOF &&
-            i + 1 != stream->count) {
+            i + 1 != token_count) {
             return false;
         }
 

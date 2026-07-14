@@ -108,16 +108,13 @@ bool lzss_decode(const LzssTokenStream *in_stream, ByteBuffer *out)
         return false;
     }
 
-    if (in_stream->count > 0 && in_stream->tokens == nullptr) {
-        return false;
-    }
-
     // The caller owns the buffer so reuse its allocated storage if available
     out->size = 0;
 
     bool eof_seen = false;
+    const size_t token_count = in_stream->tokens.size();
 
-    for (size_t i = 0; i < in_stream->count; ++i) {
+    for (size_t i = 0; i < token_count; ++i) {
         const LzssToken &token = in_stream->tokens[i];
 
         switch (token.type) {
@@ -151,7 +148,7 @@ bool lzss_decode(const LzssTokenStream *in_stream, ByteBuffer *out)
 
         case LZSS_TOKEN_EOF:
             // EOF must occur exactly once and be the final token
-            if (eof_seen || i + 1 != in_stream->count) {
+            if (eof_seen || i + 1 != token_count) {
                 return false;
             }
 

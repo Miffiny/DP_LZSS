@@ -360,8 +360,7 @@ bool lzss_ac_encode_stream_dynamic(
     if (codec == nullptr ||
         ac == nullptr ||
         bio == nullptr ||
-        stream == nullptr ||
-        (stream->count > 0 && stream->tokens == nullptr)) {
+        stream == nullptr) {
         return false;
     }
 
@@ -369,7 +368,9 @@ bool lzss_ac_encode_stream_dynamic(
 
     bool eof_seen = false;
 
-    for (size_t i = 0; i < stream->count; ++i) {
+    const size_t token_count = stream->tokens.size();
+
+    for (size_t i = 0; i < token_count; ++i) {
         const LzssToken *token = &stream->tokens[i];
 
         if (!token_is_valid(codec, token) || eof_seen) {
@@ -377,7 +378,7 @@ bool lzss_ac_encode_stream_dynamic(
         }
 
         if (token->type == LZSS_TOKEN_EOF &&
-            i + 1 != stream->count) {
+            i + 1 != token_count) {
             return false;
         }
 

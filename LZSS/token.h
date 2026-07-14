@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <vector>
 
 typedef enum {
     LZSS_TOKEN_LITERAL,
@@ -20,11 +21,8 @@ typedef struct {
     };
 } LzssToken;
 
-//dynamic array, might be changed
 typedef struct {
-    LzssToken* tokens;
-    size_t count;
-    size_t capacity;
+    std::vector<LzssToken> tokens;
 } LzssTokenStream;
 
 void token_stream_init(LzssTokenStream* stream, size_t initial_capacity);
