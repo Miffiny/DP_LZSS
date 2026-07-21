@@ -9,9 +9,10 @@ endif
 CXX := g++
 CC := gcc
 
-CXXFLAGS := -std=c++17 -Wall -Wextra -O2
+CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -pthread
 CFLAGS := -std=c11 -Wall -Wextra -O2
 CPPFLAGS := -I. -ILZSS -DLZSS_DEFAULT_ENTROPY_CODEC=LZSS_ENTROPY_CODEC_TANS
+LDFLAGS := -pthread
 
 CPP_SRCS := $(wildcard *.cpp) $(wildcard LZSS/*.cpp)
 C_SRCS := $(wildcard *.c)
@@ -20,7 +21,7 @@ OBJS := $(CPP_SRCS:.cpp=.o) $(C_SRCS:.c=.o)
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CXX) $(OBJS) -o $@
+	$(CXX) $(OBJS) $(LDFLAGS) -o $@
 
 %.o: %.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@

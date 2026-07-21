@@ -3,6 +3,7 @@
 #include "LZSS/decoder.h"
 #include "LZSS/parser.h"
 #include "arithmetic.h"
+#include "block_tans.h"
 #include "tans.h"
 
 #include <algorithm>
@@ -243,7 +244,7 @@ struct CompressionResult {
     double decompress_ms;
 };
 
-static void collect_token_stats(
+[[maybe_unused]] static void collect_token_stats(
     const LzssTokenStream& stream,
     CompressionResult *result)
 {
@@ -297,11 +298,90 @@ static std::vector<uint8_t> read_file(const std::filesystem::path& path)
     return data;
 }
 
+#if LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_TANS
+static void copy_block_stats_to_result(
+    const LzssBlockStats& stats,
+    CompressionResult *result)
+{
+    result->token_count = stats.token_count;
+    result->match_token_count = stats.match_token_count;
+    result->literal_token_count = stats.literal_token_count;
+    result->match_memory = stats.match_memory;
+    result->match_length_total = stats.match_length_total;
+}
+
+static CompressionResult compress_decompress_file_tans_blocks(
+    const std::vector<uint8_t>& input,
+    const LzssConfig& config,
+    std::ostream& err)
+{
+    CompressionResult result{};
+
+    LzssTansBlockStream block_stream;
+    lzss_tans_block_stream_init(&block_stream);
+
+    const auto compress_start = std::chrono::steady_clock::now();
+    bool ok = lzss_tans_encode_blocks(
+        input.empty() ? nullptr : input.data(),
+        input.size(),
+        &config,
+        &block_stream
+    );
+    const auto compress_end = std::chrono::steady_clock::now();
+
+    copy_block_stats_to_result(block_stream.stats, &result);
+    result.compressed_size =
+        lzss_tans_block_stream_compressed_size(&block_stream);
+    result.compress_ms =
+        std::chrono::duration<double, std::milli>(
+            compress_end - compress_start
+        ).count();
+
+    if (!ok) {
+        err << "  block tANS compression failed\n";
+        lzss_tans_block_stream_clear(&block_stream);
+        return result;
+    }
+
+    ByteBuffer decoded_bytes;
+    buffer_init(&decoded_bytes);
+    buffer_init_with_capacity(&decoded_bytes, input.size());
+
+    const auto decompress_start = std::chrono::steady_clock::now();
+    ok = lzss_tans_decode_blocks(&block_stream, &config, &decoded_bytes);
+    const auto decompress_end = std::chrono::steady_clock::now();
+
+    result.decompress_ms =
+        std::chrono::duration<double, std::milli>(
+            decompress_end - decompress_start
+        ).count();
+
+    const bool same_size = decoded_bytes.size == input.size();
+    const bool same_data = same_size &&
+        std::equal(input.begin(), input.end(), decoded_bytes.data);
+
+    if (!(ok && same_data)) {
+        err << "  block tANS decompression failed or data mismatch"
+            << " decoded_size=" << decoded_bytes.size
+            << " blocks=" << block_stream.blocks.size() << '\n';
+    }
+
+    result.ok = ok && same_data;
+
+    buffer_free(&decoded_bytes);
+    lzss_tans_block_stream_clear(&block_stream);
+    return result;
+}
+#endif
+
 static CompressionResult compress_decompress_file(
     const std::vector<uint8_t>& input,
     const LzssConfig& config,
     std::ostream& err)
 {
+#if LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_TANS
+    return compress_decompress_file_tans_blocks(input, config, err);
+#else
     CompressionResult result{};
 
     LzssTokenStream stream;
@@ -428,7 +508,7 @@ static CompressionResult compress_decompress_file(
         );
 
         ok = lzss_ac_decode_stream(
-            &decoder_codec,
+            &ac_decoder_codec,
             &decoder,
             &reader,
             &decoded_stream
@@ -476,6 +556,7 @@ static CompressionResult compress_decompress_file(
     token_stream_free(&stream);
 
     return result;
+#endif
 }
 
 static bool run_case(const std::string& name, const std::vector<uint8_t>& input,
@@ -601,6 +682,9 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
 
     out << "Silesia benchmark\n";
     out << "Entropy codec = " << default_entropy_codec_name() << "\n";
+#if LZSS_DEFAULT_ENTROPY_CODEC == LZSS_ENTROPY_CODEC_TANS
+    out << "Block size = " << LZSS_TANS_BLOCK_SIZE << " bytes\n";
+#endif
     out << "Compression factor = original_size / compressed_size\n\n";
     out << std::left << std::setw(14) << "file"
         << std::right << std::setw(13) << "input"
