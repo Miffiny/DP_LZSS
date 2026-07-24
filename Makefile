@@ -11,11 +11,12 @@ CC := gcc
 
 CXXFLAGS := -std=c++17 -Wall -Wextra -O2 -pthread
 CFLAGS := -std=c11 -Wall -Wextra -O2
-CPPFLAGS := -I. -ILZSS -DLZSS_DEFAULT_ENTROPY_CODEC=LZSS_ENTROPY_CODEC_TANS
+CPPFLAGS := -I. -ILZSS
 LDFLAGS := -pthread
 
-CPP_SRCS := $(wildcard *.cpp) $(wildcard LZSS/*.cpp)
-C_SRCS := $(wildcard *.c)
+CPP_SRCS := main.cpp lzss_test.cpp tans.cpp block_tans.cpp \
+	LZSS/decoder.cpp LZSS/mf.cpp LZSS/parser.cpp LZSS/token.cpp
+C_SRCS := ac.c bio.c
 OBJS := $(CPP_SRCS:.cpp=.o) $(C_SRCS:.c=.o)
 
 all: $(TARGET)

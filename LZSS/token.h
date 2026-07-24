@@ -4,27 +4,19 @@
 #include <cstddef>
 #include <vector>
 
-typedef enum {
-    LZSS_TOKEN_LITERAL,
-    LZSS_TOKEN_MATCH,
-    LZSS_TOKEN_EOF
-} LzssTokenType;
+struct LzssSequence {
+    uint32_t match_distance;
+    uint32_t match_length;
 
-typedef struct {
-    LzssTokenType type;
-    union {
-        uint8_t literal;
-        struct {
-            uint32_t distance;
-            uint32_t length;
-        } match;
-    };
-} LzssToken;
+    uint32_t lit_length;
+    const uint8_t* literals_ptr;
+};
 
-typedef struct {
-    std::vector<LzssToken> tokens;
-} LzssTokenStream;
+struct LzssSequenceStream {
+    std::vector<LzssSequence> sequences;
+    std::vector<uint8_t> literals;
+};
 
-void token_stream_init(LzssTokenStream* stream, size_t initial_capacity);
-void token_stream_push(LzssTokenStream* stream, LzssToken token);
-void token_stream_free(LzssTokenStream* stream);
+void sequence_stream_init(LzssSequenceStream* stream, size_t initial_capacity);
+void sequence_stream_push(LzssSequenceStream* stream, LzssSequence seq);
+void sequence_stream_free(LzssSequenceStream* stream);

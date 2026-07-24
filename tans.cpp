@@ -5,6 +5,11 @@
 #include <limits>
 #include <vector>
 
+struct tans_bit_chunk {
+    uint32_t bits;
+    uint8_t count;
+};
+
 int tans_model_init(struct tans_model *tm, const struct model *m)
 {
     if (tm == NULL || m == NULL || m->total != TANS_L) {
@@ -73,9 +78,6 @@ void tans_model_destroy(struct tans_model *tm)
 void tans_encode_init(struct tans_state *ts)
 {
     ts->x = TANS_L;
-    ts->chunks = NULL;
-    ts->chunk_count = 0;
-    ts->chunk_capacity = 0;
 }
 
 static struct tans_bit_chunk tans_encode_symbol_to_chunk(
@@ -103,58 +105,9 @@ static struct tans_bit_chunk tans_encode_symbol_to_chunk(
     return chunk;
 }
 
-static void tans_state_push_chunk(
-    struct tans_state *ts,
-    const struct tans_bit_chunk *chunk)
-{
-    if (chunk->count == 0) {
-        return;
-    }
-
-    if (ts->chunk_count == ts->chunk_capacity) {
-        size_t new_capacity = ts->chunk_capacity == 0
-            ? 32
-            : ts->chunk_capacity * 2;
-
-        void *new_chunks = realloc(
-            ts->chunks,
-            new_capacity * sizeof(ts->chunks[0])
-        );
-
-        if (new_chunks == NULL) {
-            abort();
-        }
-
-        ts->chunks = (struct tans_bit_chunk *)new_chunks;
-        ts->chunk_capacity = new_capacity;
-    }
-
-    ts->chunks[ts->chunk_count++] = *chunk;
-}
-
-void tans_encode_symbol(struct tans_state *ts, struct bio *bio, size_t symb, const struct tans_model *tm)
-{
-    (void)bio;
-
-    const struct tans_bit_chunk chunk =
-        tans_encode_symbol_to_chunk(ts, symb, tm);
-
-    tans_state_push_chunk(ts, &chunk);
-}
-
 void tans_encode_flush(struct tans_state *ts, struct bio *bio)
 {
     bio_write_bits(bio, ts->x - TANS_L, 12);
-
-    for (size_t i = ts->chunk_count; i > 0; --i) {
-        const struct tans_bit_chunk *chunk = &ts->chunks[i - 1];
-        bio_write_bits(bio, chunk->bits, chunk->count);
-    }
-
-    free(ts->chunks);
-    ts->chunks = NULL;
-    ts->chunk_count = 0;
-    ts->chunk_capacity = 0;
 }
 
 void tans_decode_init(struct tans_state *ts, struct bio *bio)
@@ -192,6 +145,26 @@ static const DeflateClass LENGTH_CLASSES[] = {
     {258, 1, 0},
 };
 
+static const DeflateClass LITERAL_LENGTH_CLASSES[] = {
+    {0, 1, 0},             {1, 1, 0},
+    {2, 2, 1},             {4, 4, 2},
+    {8, 8, 3},             {16, 16, 4},
+    {32, 32, 5},           {64, 64, 6},
+    {128, 128, 7},         {256, 256, 8},
+    {512, 512, 9},         {1024, 1024, 10},
+    {2048, 2048, 11},      {4096, 4096, 12},
+    {8192, 8192, 13},      {16384, 16384, 14},
+    {32768, 32768, 15},    {65536, 65536, 16},
+    {131072, 131072, 17},  {262144, 262144, 18},
+    {524288, 524288, 19},  {1048576, 1048576, 20},
+    {2097152, 2097152, 21}, {4194304, 4194304, 22},
+    {8388608, 8388608, 23}, {16777216, 16777216, 24},
+    {33554432, 33554432, 25}, {67108864, 67108864, 26},
+    {134217728, 134217728, 27}, {268435456, 268435456, 28},
+    {536870912, 536870912, 29}, {1073741824, 1073741824, 30},
+    {2147483648u, 2147483648u, 31},
+};
+
 static const DeflateClass DISTANCE_CLASSES[] = {
     {1, 1, 0},       {2, 1, 0},       {3, 1, 0},
     {4, 1, 0},       {5, 2, 1},       {7, 2, 1},
@@ -213,9 +186,10 @@ static constexpr size_t array_count(const T (&)[N])
     return N;
 }
 
-static uint32_t class_last_value(const DeflateClass *cls)
+static uint64_t class_last_value(const DeflateClass *cls)
 {
-    return cls->base + cls->size - 1;
+    return static_cast<uint64_t>(cls->base) +
+           static_cast<uint64_t>(cls->size) - 1;
 }
 
 static bool class_intersects_range(
@@ -223,7 +197,7 @@ static bool class_intersects_range(
     uint32_t min_value,
     uint32_t max_value)
 {
-    return cls->base <= max_value &&
+    return static_cast<uint64_t>(cls->base) <= max_value &&
            class_last_value(cls) >= min_value;
 }
 
@@ -280,7 +254,8 @@ static bool find_class_for_value(
             continue;
         }
 
-        if (value >= cls->base && value <= class_last_value(cls)) {
+        if (value >= cls->base &&
+            static_cast<uint64_t>(value) <= class_last_value(cls)) {
             *out_symbol = symbol;
             *out_class = cls;
             return true;
@@ -342,12 +317,12 @@ static bool is_valid_config(const LzssConfig *config)
     }
 
     if (config->min_match_length < LENGTH_CLASSES[0].base ||
-        config->max_match_length >
+        static_cast<uint64_t>(config->max_match_length) >
             class_last_value(&LENGTH_CLASSES[array_count(LENGTH_CLASSES) - 1])) {
         return false;
     }
 
-    if (config->window_size >
+    if (static_cast<uint64_t>(config->window_size) >
         class_last_value(&DISTANCE_CLASSES[array_count(DISTANCE_CLASSES) - 1])) {
         return false;
     }
@@ -355,28 +330,54 @@ static bool is_valid_config(const LzssConfig *config)
     return true;
 }
 
-static bool token_is_valid(
+static bool sequence_match_is_valid(
     const LzssTansCodec *codec,
-    const LzssToken *token)
+    const LzssSequence *sequence)
 {
-    if (codec == nullptr || token == nullptr) {
+    if (codec == nullptr || sequence == nullptr) {
         return false;
     }
 
-    switch (token->type) {
-    case LZSS_TOKEN_LITERAL:
-    case LZSS_TOKEN_EOF:
-        return true;
+    if (sequence->match_length == 0) {
+        return sequence->match_distance == 0;
+    }
 
-    case LZSS_TOKEN_MATCH:
-        return token->match.distance >= 1 &&
-               token->match.distance <= codec->config.window_size &&
-               token->match.length >= codec->config.min_match_length &&
-               token->match.length <= codec->config.max_match_length;
+    return sequence->match_distance >= 1 &&
+           sequence->match_distance <= codec->config.window_size &&
+           sequence->match_length >= codec->config.min_match_length &&
+           sequence->match_length <= codec->config.max_match_length;
+}
 
-    default:
+static bool sequence_layout_is_valid(
+    const LzssTansCodec *codec,
+    const LzssSequenceStream *stream)
+{
+    if (codec == nullptr || stream == nullptr) {
         return false;
     }
+
+    for (size_t i = 0; i < stream->sequences.size(); ++i) {
+        const LzssSequence& sequence = stream->sequences[i];
+
+        if (!sequence_match_is_valid(codec, &sequence)) {
+            return false;
+        }
+
+        if (sequence.lit_length > 0 && sequence.literals_ptr == nullptr) {
+            return false;
+        }
+
+        if (i == 0) {
+            if (sequence.match_length != 0 ||
+                sequence.match_distance != 0) {
+                return false;
+            }
+        } else if (sequence.match_length == 0) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 static bool checked_size_to_u32(size_t value, uint32_t *out_value)
@@ -552,7 +553,7 @@ static bool write_static_model_header(
     struct bio *bio,
     const LzssTansCodec *codec)
 {
-    return write_model_frequencies(bio, &codec->event_model) &&
+    return write_model_frequencies(bio, &codec->literal_length_model) &&
            write_model_frequencies(bio, &codec->literal_model) &&
            write_model_frequencies(bio, &codec->length_model) &&
            write_model_frequencies(bio, &codec->distance_model);
@@ -562,97 +563,99 @@ static bool read_static_model_header(
     struct bio *bio,
     LzssTansCodec *codec)
 {
-    if (!read_model_frequencies(bio, &codec->event_model) ||
+    if (!read_model_frequencies(bio, &codec->literal_length_model) ||
         !read_model_frequencies(bio, &codec->literal_model) ||
         !read_model_frequencies(bio, &codec->length_model) ||
         !read_model_frequencies(bio, &codec->distance_model)) {
         return false;
     }
 
-    return codec->event_model.total == STATIC_MODEL_TOTAL;
+    return true;
 }
 
 static bool collect_static_model_stats(
     LzssTansCodec *codec,
-    const LzssTokenStream *stream)
+    const LzssSequenceStream *stream)
 {
-    if (codec == nullptr || stream == nullptr) {
+    if (codec == nullptr || !sequence_layout_is_valid(codec, stream)) {
         return false;
     }
 
-    std::vector<uint32_t> event_frequencies(codec->event_model.count, 0);
+    std::vector<uint32_t> literal_length_frequencies(
+        codec->literal_length_model.count,
+        0
+    );
     std::vector<uint32_t> literal_frequencies(codec->literal_model.count, 0);
     std::vector<uint32_t> length_frequencies(codec->length_model.count, 0);
     std::vector<uint32_t> distance_frequencies(codec->distance_model.count, 0);
 
-    bool eof_seen = false;
+    for (size_t i = 0; i < stream->sequences.size(); ++i) {
+        const LzssSequence& sequence = stream->sequences[i];
 
-    const size_t token_count = stream->tokens.size();
+        size_t literal_length_symbol = 0;
+        const DeflateClass *literal_length_class = nullptr;
 
-    for (size_t i = 0; i < token_count; ++i) {
-        const LzssToken *token = &stream->tokens[i];
-
-        if (!token_is_valid(codec, token) || eof_seen) {
+        if (!find_class_for_value(
+                LITERAL_LENGTH_CLASSES,
+                array_count(LITERAL_LENGTH_CLASSES),
+                0,
+                UINT32_MAX,
+                sequence.lit_length,
+                &literal_length_symbol,
+                &literal_length_class)) {
             return false;
         }
 
-        if (token->type == LZSS_TOKEN_EOF &&
-            i + 1 != token_count) {
+        (void)literal_length_class;
+        literal_length_frequencies[literal_length_symbol]++;
+
+        for (uint32_t literal_index = 0;
+             literal_index < sequence.lit_length;
+             ++literal_index) {
+            literal_frequencies[sequence.literals_ptr[literal_index]]++;
+        }
+
+        if (i == 0) {
+            continue;
+        }
+
+        size_t length_symbol = 0;
+        const DeflateClass *length_class = nullptr;
+
+        if (!find_class_for_value(
+                LENGTH_CLASSES,
+                array_count(LENGTH_CLASSES),
+                static_cast<uint32_t>(codec->config.min_match_length),
+                static_cast<uint32_t>(codec->config.max_match_length),
+                sequence.match_length,
+                &length_symbol,
+                &length_class)) {
             return false;
         }
 
-        event_frequencies[token->type]++;
+        size_t distance_symbol = 0;
+        const DeflateClass *distance_class = nullptr;
 
-        switch (token->type) {
-        case LZSS_TOKEN_LITERAL:
-            literal_frequencies[token->literal]++;
-            break;
-
-        case LZSS_TOKEN_MATCH: {
-            size_t length_symbol = 0;
-            const DeflateClass *length_class = nullptr;
-
-            if (!find_class_for_value(
-                    LENGTH_CLASSES,
-                    array_count(LENGTH_CLASSES),
-                    static_cast<uint32_t>(codec->config.min_match_length),
-                    static_cast<uint32_t>(codec->config.max_match_length),
-                    token->match.length,
-                    &length_symbol,
-                    &length_class)) {
-                return false;
-            }
-
-            size_t distance_symbol = 0;
-            const DeflateClass *distance_class = nullptr;
-
-            if (!find_class_for_value(
-                    DISTANCE_CLASSES,
-                    array_count(DISTANCE_CLASSES),
-                    1,
-                    static_cast<uint32_t>(codec->config.window_size),
-                    token->match.distance,
-                    &distance_symbol,
-                    &distance_class)) {
-                return false;
-            }
-
-            length_frequencies[length_symbol]++;
-            distance_frequencies[distance_symbol]++;
-            break;
-        }
-
-        case LZSS_TOKEN_EOF:
-            eof_seen = true;
-            break;
-
-        default:
+        if (!find_class_for_value(
+                DISTANCE_CLASSES,
+                array_count(DISTANCE_CLASSES),
+                1,
+                static_cast<uint32_t>(codec->config.window_size),
+                sequence.match_distance,
+                &distance_symbol,
+                &distance_class)) {
             return false;
         }
+
+        (void)length_class;
+        (void)distance_class;
+        length_frequencies[length_symbol]++;
+        distance_frequencies[distance_symbol]++;
     }
 
-    return eof_seen &&
-           model_set_frequencies_tans(&codec->event_model, event_frequencies) &&
+    return model_set_frequencies_tans(
+               &codec->literal_length_model,
+               literal_length_frequencies) &&
            model_set_frequencies_tans(&codec->literal_model, literal_frequencies) &&
            model_set_frequencies_tans(&codec->length_model, length_frequencies) &&
            model_set_frequencies_tans(&codec->distance_model, distance_frequencies);
@@ -681,9 +684,9 @@ static bool init_tans_model_if_used(
 static bool init_all_tans_models(LzssTansCodec *codec)
 {
     return init_tans_model_if_used(
-               &codec->event_tans_model,
-               &codec->event_model,
-               &codec->event_tans_ready) &&
+               &codec->literal_length_tans_model,
+               &codec->literal_length_model,
+               &codec->literal_length_tans_ready) &&
            init_tans_model_if_used(
                &codec->literal_tans_model,
                &codec->literal_model,
@@ -700,8 +703,8 @@ static bool init_all_tans_models(LzssTansCodec *codec)
 
 static void destroy_tans_models(LzssTansCodec *codec)
 {
-    if (codec->event_tans_ready) {
-        tans_model_destroy(&codec->event_tans_model);
+    if (codec->literal_length_tans_ready) {
+        tans_model_destroy(&codec->literal_length_tans_model);
     }
 
     if (codec->literal_tans_ready) {
@@ -716,16 +719,44 @@ static void destroy_tans_models(LzssTansCodec *codec)
         tans_model_destroy(&codec->distance_tans_model);
     }
 
-    codec->event_tans_ready = false;
+    codec->literal_length_tans_ready = false;
     codec->literal_tans_ready = false;
     codec->length_tans_ready = false;
     codec->distance_tans_ready = false;
 }
 
+static bool encode_literal_length_extras(
+    struct bio *extra_bio,
+    const LzssSequence *sequence)
+{
+    size_t literal_length_symbol = 0;
+    const DeflateClass *literal_length_class = nullptr;
+
+    if (!find_class_for_value(
+            LITERAL_LENGTH_CLASSES,
+            array_count(LITERAL_LENGTH_CLASSES),
+            0,
+            UINT32_MAX,
+            sequence->lit_length,
+            &literal_length_symbol,
+            &literal_length_class)) {
+        return false;
+    }
+
+    (void)literal_length_symbol;
+    bio_write_bits(
+        extra_bio,
+        sequence->lit_length - literal_length_class->base,
+        literal_length_class->extra_bits
+    );
+
+    return true;
+}
+
 static bool encode_match_extras(
     LzssTansCodec *codec,
     struct bio *extra_bio,
-    const LzssToken *token)
+    const LzssSequence *sequence)
 {
     size_t length_symbol = 0;
     const DeflateClass *length_class = nullptr;
@@ -735,7 +766,7 @@ static bool encode_match_extras(
             array_count(LENGTH_CLASSES),
             static_cast<uint32_t>(codec->config.min_match_length),
             static_cast<uint32_t>(codec->config.max_match_length),
-            token->match.length,
+            sequence->match_length,
             &length_symbol,
             &length_class)) {
         return false;
@@ -744,7 +775,7 @@ static bool encode_match_extras(
     (void)length_symbol;
     bio_write_bits(
         extra_bio,
-        token->match.length - length_class->base,
+        sequence->match_length - length_class->base,
         length_class->extra_bits
     );
 
@@ -756,7 +787,7 @@ static bool encode_match_extras(
             array_count(DISTANCE_CLASSES),
             1,
             static_cast<uint32_t>(codec->config.window_size),
-            token->match.distance,
+            sequence->match_distance,
             &distance_symbol,
             &distance_class)) {
         return false;
@@ -765,8 +796,44 @@ static bool encode_match_extras(
     (void)distance_symbol;
     bio_write_bits(
         extra_bio,
-        token->match.distance - distance_class->base,
+        sequence->match_distance - distance_class->base,
         distance_class->extra_bits
+    );
+
+    return true;
+}
+
+static bool encode_literal_length_symbol_reverse(
+    LzssTansCodec *codec,
+    struct tans_state *state,
+    std::vector<struct tans_bit_chunk> *chunks,
+    const LzssSequence *sequence)
+{
+    if (!codec->literal_length_tans_ready) {
+        return false;
+    }
+
+    size_t literal_length_symbol = 0;
+    const DeflateClass *literal_length_class = nullptr;
+
+    if (!find_class_for_value(
+            LITERAL_LENGTH_CLASSES,
+            array_count(LITERAL_LENGTH_CLASSES),
+            0,
+            UINT32_MAX,
+            sequence->lit_length,
+            &literal_length_symbol,
+            &literal_length_class)) {
+        return false;
+    }
+
+    (void)literal_length_class;
+    chunks->push_back(
+        tans_encode_symbol_to_chunk(
+            state,
+            literal_length_symbol,
+            &codec->literal_length_tans_model
+        )
     );
 
     return true;
@@ -776,7 +843,7 @@ static bool encode_match_symbols_reverse(
     LzssTansCodec *codec,
     struct tans_state *state,
     std::vector<struct tans_bit_chunk> *chunks,
-    const LzssToken *token)
+    const LzssSequence *sequence)
 {
     size_t length_symbol = 0;
     const DeflateClass *length_class = nullptr;
@@ -787,7 +854,7 @@ static bool encode_match_symbols_reverse(
             array_count(LENGTH_CLASSES),
             static_cast<uint32_t>(codec->config.min_match_length),
             static_cast<uint32_t>(codec->config.max_match_length),
-            token->match.length,
+            sequence->match_length,
             &length_symbol,
             &length_class)) {
         return false;
@@ -802,7 +869,7 @@ static bool encode_match_symbols_reverse(
             array_count(DISTANCE_CLASSES),
             1,
             static_cast<uint32_t>(codec->config.window_size),
-            token->match.distance,
+            sequence->match_distance,
             &distance_symbol,
             &distance_class)) {
         return false;
@@ -825,6 +892,52 @@ static bool encode_match_symbols_reverse(
         )
     );
 
+    return true;
+}
+
+static bool decode_literal_length_symbol(
+    LzssTansCodec *codec,
+    struct tans_state *state,
+    struct bio *tans_bio,
+    struct bio *extra_bio,
+    uint32_t *out_length)
+{
+    if (!codec->literal_length_tans_ready) {
+        return false;
+    }
+
+    const size_t literal_length_symbol =
+        tans_decode_symbol(
+            state,
+            tans_bio,
+            &codec->literal_length_tans_model
+        );
+
+    if (literal_length_symbol >= codec->literal_length_model.count) {
+        return false;
+    }
+
+    const DeflateClass *literal_length_class = nullptr;
+
+    if (!find_class_by_symbol(
+            LITERAL_LENGTH_CLASSES,
+            array_count(LITERAL_LENGTH_CLASSES),
+            0,
+            UINT32_MAX,
+            literal_length_symbol,
+            &literal_length_class)) {
+        return false;
+    }
+
+    const uint32_t extra_value = literal_length_class->extra_bits == 0
+        ? 0
+        : bio_read_bits(extra_bio, literal_length_class->extra_bits);
+
+    if (extra_value >= literal_length_class->size) {
+        return false;
+    }
+
+    *out_length = literal_length_class->base + extra_value;
     return true;
 }
 
@@ -858,8 +971,9 @@ static bool decode_length_symbol(
         return false;
     }
 
-    const uint32_t extra_value =
-        bio_read_bits(extra_bio, length_class->extra_bits);
+    const uint32_t extra_value = length_class->extra_bits == 0
+        ? 0
+        : bio_read_bits(extra_bio, length_class->extra_bits);
 
     if (extra_value >= length_class->size) {
         return false;
@@ -906,8 +1020,9 @@ static bool decode_distance_symbol(
         return false;
     }
 
-    const uint32_t extra_value =
-        bio_read_bits(extra_bio, distance_class->extra_bits);
+    const uint32_t extra_value = distance_class->extra_bits == 0
+        ? 0
+        : bio_read_bits(extra_bio, distance_class->extra_bits);
 
     if (extra_value >= distance_class->size) {
         return false;
@@ -950,6 +1065,22 @@ bool lzss_tans_codec_init(
             static_cast<uint32_t>(config->window_size)
         );
 
+    const size_t literal_length_class_count =
+        active_class_count(
+            LITERAL_LENGTH_CLASSES,
+            array_count(LITERAL_LENGTH_CLASSES),
+            0,
+            UINT32_MAX
+        );
+
+    codec->literal_length_extra_bit_count =
+        max_extra_bit_count(
+            LITERAL_LENGTH_CLASSES,
+            array_count(LITERAL_LENGTH_CLASSES),
+            0,
+            UINT32_MAX
+        );
+
     codec->length_extra_bit_count =
         max_extra_bit_count(
             LENGTH_CLASSES,
@@ -966,7 +1097,7 @@ bool lzss_tans_codec_init(
             static_cast<uint32_t>(config->window_size)
         );
 
-    model_create(&codec->event_model, 3);
+    model_create(&codec->literal_length_model, literal_length_class_count);
     model_create(&codec->literal_model, 256);
     model_create(&codec->length_model, length_class_count);
     model_create(&codec->distance_model, distance_class_count);
@@ -983,8 +1114,8 @@ void lzss_tans_codec_destroy(
 
     destroy_tans_models(codec);
 
-    if (codec->event_model.table != nullptr) {
-        model_destroy(&codec->event_model);
+    if (codec->literal_length_model.table != nullptr) {
+        model_destroy(&codec->literal_length_model);
     }
 
     if (codec->literal_model.table != nullptr) {
@@ -1005,7 +1136,7 @@ void lzss_tans_codec_destroy(
 bool lzss_tans_encode_stream(
     LzssTansCodec *codec,
     struct bio *bio,
-    const LzssTokenStream *stream)
+    const LzssSequenceStream *stream)
 {
     if (codec == nullptr ||
         bio == nullptr ||
@@ -1013,18 +1144,63 @@ bool lzss_tans_encode_stream(
         return false;
     }
 
+    uint32_t sequence_count_u32 = 0;
+    if (!checked_size_to_u32(stream->sequences.size(), &sequence_count_u32)) {
+        return false;
+    }
+
     if (!collect_static_model_stats(codec, stream) ||
+        !write_u32(bio, sequence_count_u32) ||
         !write_static_model_header(bio, codec) ||
         !init_all_tans_models(codec)) {
         return false;
     }
 
-    const size_t token_count = stream->tokens.size();
+    size_t symbol_count = stream->sequences.size();
+    size_t extra_bit_capacity = 32;
+
+    for (size_t i = 0; i < stream->sequences.size(); ++i) {
+        const LzssSequence& sequence = stream->sequences[i];
+
+        if (symbol_count >
+            std::numeric_limits<size_t>::max() - sequence.lit_length) {
+            return false;
+        }
+        symbol_count += sequence.lit_length;
+
+        if (extra_bit_capacity >
+            std::numeric_limits<size_t>::max() -
+                codec->literal_length_extra_bit_count) {
+            return false;
+        }
+        extra_bit_capacity += codec->literal_length_extra_bit_count;
+
+        if (i == 0) {
+            continue;
+        }
+
+        if (symbol_count >
+            std::numeric_limits<size_t>::max() - 2) {
+            return false;
+        }
+        symbol_count += 2;
+
+        const size_t match_extra_bits =
+            codec->length_extra_bit_count +
+            codec->distance_extra_bit_count;
+
+        if (extra_bit_capacity >
+            std::numeric_limits<size_t>::max() - match_extra_bits) {
+            return false;
+        }
+        extra_bit_capacity += match_extra_bits;
+    }
+
     const size_t extra_word_capacity =
-        std::max<size_t>(16, token_count + 64);
+        std::max<size_t>(1, (extra_bit_capacity + 31) / 32 + 1);
 
     std::vector<struct tans_bit_chunk> tans_chunks;
-    tans_chunks.reserve(token_count * 3);
+    tans_chunks.reserve(symbol_count);
     std::vector<uint32_t> extra_words(extra_word_capacity, 0);
 
     struct bio extra_writer{};
@@ -1036,11 +1212,15 @@ bool lzss_tans_encode_stream(
         BIO_MODE_WRITE
     );
 
-    for (size_t i = 0; i < token_count; ++i) {
-        const LzssToken *token = &stream->tokens[i];
+    for (size_t i = 0; i < stream->sequences.size(); ++i) {
+        const LzssSequence *sequence = &stream->sequences[i];
 
-        if (token->type == LZSS_TOKEN_MATCH &&
-            !encode_match_extras(codec, &extra_writer, token)) {
+        if (i > 0 &&
+            !encode_match_extras(codec, &extra_writer, sequence)) {
+            return false;
+        }
+
+        if (!encode_literal_length_extras(&extra_writer, sequence)) {
             return false;
         }
     }
@@ -1048,66 +1228,45 @@ bool lzss_tans_encode_stream(
     struct tans_state state{};
     tans_encode_init(&state);
 
-    bool eof_seen = false;
+    for (size_t i = stream->sequences.size(); i > 0; --i) {
+        const size_t sequence_index = i - 1;
+        const LzssSequence *sequence = &stream->sequences[sequence_index];
 
-    for (size_t i = token_count; i > 0; --i) {
-        const LzssToken *token = &stream->tokens[i - 1];
-
-        if (!token_is_valid(codec, token)) {
-            return false;
-        }
-
-        if (token->type == LZSS_TOKEN_EOF) {
-            eof_seen = true;
-        }
-
-        switch (token->type) {
-        case LZSS_TOKEN_LITERAL:
+        for (uint32_t literal_index = sequence->lit_length;
+             literal_index > 0;
+             --literal_index) {
             if (!codec->literal_tans_ready) {
                 return false;
             }
 
+            const uint8_t literal =
+                sequence->literals_ptr[literal_index - 1];
+
             tans_chunks.push_back(
                 tans_encode_symbol_to_chunk(
                     &state,
-                    token->literal,
+                    literal,
                     &codec->literal_tans_model
                 )
             );
-            break;
-
-        case LZSS_TOKEN_MATCH:
-            if (!encode_match_symbols_reverse(
-                    codec,
-                    &state,
-                    &tans_chunks,
-                    token)) {
-                return false;
-            }
-            break;
-
-        case LZSS_TOKEN_EOF:
-            break;
-
-        default:
-            return false;
         }
 
-        if (!codec->event_tans_ready) {
-            return false;
-        }
-
-        tans_chunks.push_back(
-            tans_encode_symbol_to_chunk(
+        if (!encode_literal_length_symbol_reverse(
+                codec,
                 &state,
-                token->type,
-                &codec->event_tans_model
-            )
-        );
-    }
+                &tans_chunks,
+                sequence)) {
+            return false;
+        }
 
-    if (!eof_seen) {
-        return false;
+        if (sequence_index > 0 &&
+            !encode_match_symbols_reverse(
+                codec,
+                &state,
+                &tans_chunks,
+                sequence)) {
+            return false;
+        }
     }
 
     bio_close(&extra_writer, BIO_MODE_WRITE);
@@ -1168,13 +1327,15 @@ bool lzss_tans_encode_stream(
 bool lzss_tans_decode_stream(
     LzssTansCodec *codec,
     struct bio *bio,
-    LzssTokenStream *out_stream)
+    LzssSequenceStream *out_stream)
 {
     if (codec == nullptr ||
         bio == nullptr ||
         out_stream == nullptr) {
         return false;
     }
+
+    const uint32_t sequence_count = read_u32(bio);
 
     if (!read_static_model_header(bio, codec) ||
         !init_all_tans_models(codec)) {
@@ -1183,6 +1344,10 @@ bool lzss_tans_decode_stream(
 
     const uint32_t tans_word_count = read_u32(bio);
     const uint32_t extra_word_count = read_u32(bio);
+
+    if (tans_word_count == 0) {
+        return false;
+    }
 
     std::vector<uint32_t> tans_words(tans_word_count, 0);
     std::vector<uint32_t> extra_words(extra_word_count, 0);
@@ -1215,45 +1380,23 @@ bool lzss_tans_decode_stream(
     struct tans_state state{};
     tans_decode_init(&state, &tans_reader);
 
-    for (;;) {
-        if (!codec->event_tans_ready) {
-            return false;
-        }
+    out_stream->sequences.clear();
+    out_stream->literals.clear();
+    out_stream->sequences.reserve(sequence_count);
 
-        const size_t event =
-            tans_decode_symbol(&state, &tans_reader, &codec->event_tans_model);
+    std::vector<size_t> literal_offsets;
+    literal_offsets.reserve(sequence_count);
 
-        if (event > LZSS_TOKEN_EOF) {
-            return false;
-        }
+    for (uint32_t i = 0; i < sequence_count; ++i) {
+        LzssSequence sequence{};
 
-        LzssToken token{};
-        token.type = static_cast<LzssTokenType>(event);
-
-        switch (token.type) {
-        case LZSS_TOKEN_LITERAL:
-            if (!codec->literal_tans_ready) {
-                return false;
-            }
-
-            token.literal = static_cast<uint8_t>(
-                tans_decode_symbol(
-                    &state,
-                    &tans_reader,
-                    &codec->literal_tans_model
-                )
-            );
-
-            token_stream_push(out_stream, token);
-            break;
-
-        case LZSS_TOKEN_MATCH:
+        if (i > 0) {
             if (!decode_length_symbol(
                     codec,
                     &state,
                     &tans_reader,
                     &extra_reader,
-                    &token.match.length)) {
+                    &sequence.match_length)) {
                 return false;
             }
 
@@ -1262,19 +1405,63 @@ bool lzss_tans_decode_stream(
                     &state,
                     &tans_reader,
                     &extra_reader,
-                    &token.match.distance)) {
+                    &sequence.match_distance)) {
+                return false;
+            }
+        }
+
+        if (!decode_literal_length_symbol(
+                codec,
+                &state,
+                &tans_reader,
+                &extra_reader,
+                &sequence.lit_length)) {
+            return false;
+        }
+
+        const size_t literal_offset = out_stream->literals.size();
+        literal_offsets.push_back(literal_offset);
+
+        if (out_stream->literals.size() >
+            std::numeric_limits<size_t>::max() - sequence.lit_length) {
+            return false;
+        }
+
+        out_stream->literals.resize(literal_offset + sequence.lit_length);
+
+        for (uint32_t literal_index = 0;
+             literal_index < sequence.lit_length;
+             ++literal_index) {
+            if (!codec->literal_tans_ready) {
                 return false;
             }
 
-            token_stream_push(out_stream, token);
-            break;
+            const size_t literal =
+                tans_decode_symbol(
+                    &state,
+                    &tans_reader,
+                    &codec->literal_tans_model
+                );
 
-        case LZSS_TOKEN_EOF:
-            token_stream_push(out_stream, token);
-            return true;
+            if (literal > UINT8_MAX) {
+                return false;
+            }
 
-        default:
-            return false;
+            out_stream->literals[literal_offset + literal_index] =
+                static_cast<uint8_t>(literal);
         }
+
+        sequence_stream_push(out_stream, sequence);
     }
+
+    const uint8_t *literal_base = out_stream->literals.data();
+    for (size_t i = 0; i < out_stream->sequences.size(); ++i) {
+        LzssSequence& sequence = out_stream->sequences[i];
+        sequence.literals_ptr =
+            sequence.lit_length == 0
+                ? nullptr
+                : literal_base + literal_offsets[i];
+    }
+
+    return sequence_layout_is_valid(codec, out_stream);
 }

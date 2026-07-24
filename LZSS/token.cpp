@@ -1,17 +1,19 @@
 #include "token.h"
 
-void token_stream_init(LzssTokenStream* stream, size_t initial_capacity) {
+void sequence_stream_init(LzssSequenceStream* stream, size_t initial_capacity) {
     if (!stream) return;
-    stream->tokens.clear();
-    stream->tokens.reserve(initial_capacity > 0 ? initial_capacity : 1024);
+    stream->sequences.clear();
+    stream->literals.clear();
+    stream->sequences.reserve(initial_capacity > 0 ? initial_capacity : 1024);
 }
 
-void token_stream_push(LzssTokenStream* stream, LzssToken token) {
+void sequence_stream_push(LzssSequenceStream* stream, LzssSequence seq) {
     if (!stream) return;
-    stream->tokens.push_back(token);
+    stream->sequences.push_back(seq);
 }
 
-void token_stream_free(LzssTokenStream* stream) {
+void sequence_stream_free(LzssSequenceStream* stream) {
     if (!stream) return;
-    std::vector<LzssToken>().swap(stream->tokens);
+    std::vector<LzssSequence>().swap(stream->sequences);
+    std::vector<uint8_t>().swap(stream->literals);
 }

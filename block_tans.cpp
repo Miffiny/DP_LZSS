@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-static constexpr size_t LZSS_TANS_MAX_WORKERS = 4;
+static constexpr size_t LZSS_TANS_MAX_WORKERS = 8;
 
 struct TansCodecGuard {
     LzssTansCodec codec{};
@@ -78,28 +78,21 @@ static size_t worker_count_for(size_t block_count)
     return std::min({block_count, hardware_count, LZSS_TANS_MAX_WORKERS});
 }
 
-static void collect_token_stats(
-    const LzssTokenStream& stream,
+static void collect_sequence_stats(
+    const LzssSequenceStream& stream,
     LzssBlockStats *stats)
 {
-    stats->token_count = stream.tokens.size();
+    stats->token_count = stream.sequences.size();
 
-    for (const LzssToken& token : stream.tokens) {
-        switch (token.type) {
-        case LZSS_TOKEN_LITERAL:
-            stats->literal_token_count++;
-            break;
+    for (const LzssSequence& sequence : stream.sequences) {
+        stats->literal_token_count += sequence.lit_length;
 
-        case LZSS_TOKEN_MATCH:
+        if (sequence.match_length > 0) {
             stats->match_token_count++;
             stats->match_memory +=
-                sizeof(token.match.distance) +
-                sizeof(token.match.length);
-            stats->match_length_total += token.match.length;
-            break;
-
-        case LZSS_TOKEN_EOF:
-            break;
+                sizeof(sequence.match_distance) +
+                sizeof(sequence.match_length);
+            stats->match_length_total += sequence.match_length;
         }
     }
 }
@@ -147,25 +140,25 @@ static bool encode_one_block(
     const uint8_t *block_input =
         block_size == 0 ? nullptr : input + block_offset;
 
-    LzssTokenStream token_stream;
-    token_stream_init(&token_stream, 0);
+    LzssSequenceStream sequence_stream;
+    sequence_stream_init(&sequence_stream, 0);
 
-    if (!lzss_encode(block_input, block_size, config, &token_stream)) {
-        token_stream_free(&token_stream);
+    if (!lzss_encode(block_input, block_size, config, &sequence_stream)) {
+        sequence_stream_free(&sequence_stream);
         return false;
     }
 
-    collect_token_stats(token_stream, &result->stats);
+    collect_sequence_stats(sequence_stream, &result->stats);
 
     const size_t word_count = std::max<size_t>(
         1024,
-        token_stream.tokens.size() * 8 + block_size + 64
+        sequence_stream.sequences.size() * 8 + block_size + 64
     );
     std::vector<uint32_t> compressed_words(word_count, 0);
 
     TansCodecGuard codec;
     if (!codec.init(config)) {
-        token_stream_free(&token_stream);
+        sequence_stream_free(&sequence_stream);
         return false;
     }
 
@@ -180,11 +173,11 @@ static bool encode_one_block(
     const bool encoded = lzss_tans_encode_stream(
         &codec.codec,
         &writer,
-        &token_stream
+        &sequence_stream
     );
     bio_close(&writer, BIO_MODE_WRITE);
 
-    token_stream_free(&token_stream);
+    sequence_stream_free(&sequence_stream);
 
     if (!encoded) {
         return false;
@@ -221,8 +214,8 @@ static bool decode_one_block(
         return false;
     }
 
-    LzssTokenStream decoded_stream;
-    token_stream_init(&decoded_stream, 0);
+    LzssSequenceStream decoded_stream;
+    sequence_stream_init(&decoded_stream, 0);
 
     bio reader{};
     bio_open(
@@ -257,7 +250,7 @@ static bool decode_one_block(
     }
 
     buffer_free(&decoded_bytes);
-    token_stream_free(&decoded_stream);
+    sequence_stream_free(&decoded_stream);
     return ok;
 }
 

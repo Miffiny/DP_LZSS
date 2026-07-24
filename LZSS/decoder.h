@@ -16,10 +16,9 @@ void buffer_init_with_capacity(ByteBuffer *buffer, size_t initial_capacity);
 void buffer_free(ByteBuffer *buffer);
 
 // writing data
-bool buffer_push_back(ByteBuffer *buffer, uint8_t byte);
 bool buffer_append(ByteBuffer *buffer, const uint8_t *src, size_t length);
 
 // copy match to buffer
 bool buffer_copy_match(ByteBuffer *buffer, uint32_t distance, uint32_t length);
 
-bool lzss_decode(const LzssTokenStream *in_stream, ByteBuffer *out);
+bool lzss_decode(const LzssSequenceStream *in_stream, ByteBuffer *out);

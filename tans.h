@@ -26,23 +26,14 @@ struct tans_model {
     uint32_t count;
 };
 
-struct tans_bit_chunk {
-    uint32_t bits;
-    uint8_t count;
-};
-
 struct tans_state {
     uint32_t x;
-    struct tans_bit_chunk *chunks;
-    size_t chunk_count;
-    size_t chunk_capacity;
 };
 
 int tans_model_init(struct tans_model *tm, const struct model *m);
 void tans_model_destroy(struct tans_model *tm);
 
 void tans_encode_init(struct tans_state *ts);
-void tans_encode_symbol(struct tans_state *ts, struct bio *bio, size_t symb, const struct tans_model *tm);
 void tans_encode_flush(struct tans_state *ts, struct bio *bio);
 
 void tans_decode_init(struct tans_state *ts, struct bio *bio);
@@ -60,20 +51,21 @@ size_t tans_decode_symbol(struct tans_state *ts, struct bio *bio, const struct t
 struct LzssTansCodec {
     LzssConfig config;
 
+    size_t literal_length_extra_bit_count;
     size_t length_extra_bit_count;
     size_t distance_extra_bit_count;
 
-    struct model event_model;
+    struct model literal_length_model;
     struct model literal_model;
     struct model length_model;
     struct model distance_model;
 
-    struct tans_model event_tans_model;
+    struct tans_model literal_length_tans_model;
     struct tans_model literal_tans_model;
     struct tans_model length_tans_model;
     struct tans_model distance_tans_model;
 
-    bool event_tans_ready;
+    bool literal_length_tans_ready;
     bool literal_tans_ready;
     bool length_tans_ready;
     bool distance_tans_ready;
@@ -91,13 +83,13 @@ void lzss_tans_codec_destroy(
 bool lzss_tans_encode_stream(
     LzssTansCodec *codec,
     struct bio *bio,
-    const LzssTokenStream *stream
+    const LzssSequenceStream *stream
 );
 
 bool lzss_tans_decode_stream(
     LzssTansCodec *codec,
     struct bio *bio,
-    LzssTokenStream *out_stream
+    LzssSequenceStream *out_stream
 );
 
 #endif

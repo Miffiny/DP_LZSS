@@ -27,6 +27,9 @@ void buffer_free(ByteBuffer *buffer) {
 }
 
 static bool buffer_ensure_capacity(ByteBuffer *buffer, size_t needed) {
+    if (!buffer) return false;
+    if (needed == 0) return true;
+
     if (buffer->size + needed <= buffer->capacity) return true;
 
     size_t new_capacity = buffer->capacity == 0 ? 1024 : buffer->capacity * 2;
@@ -42,13 +45,9 @@ static bool buffer_ensure_capacity(ByteBuffer *buffer, size_t needed) {
     return true;
 }
 
-bool buffer_push_back(ByteBuffer *buffer, uint8_t byte) {
-    if (!buffer_ensure_capacity(buffer, 1)) return false;
-    buffer->data[buffer->size++] = byte;
-    return true;
-}
-
 bool buffer_append(ByteBuffer *buffer, const uint8_t *src, size_t length) {
+    if (length == 0) return true;
+    if (!src) return false;
     if (!buffer_ensure_capacity(buffer, length)) return false;
     memcpy(buffer->data + buffer->size, src, length);
     buffer->size += length;
@@ -102,7 +101,7 @@ bool buffer_copy_match(ByteBuffer *buffer, uint32_t distance, uint32_t length) {
     return true;
 }
 
-bool lzss_decode(const LzssTokenStream *in_stream, ByteBuffer *out)
+bool lzss_decode(const LzssSequenceStream *in_stream, ByteBuffer *out)
 {
     if (in_stream == nullptr || out == nullptr) {
         return false;
@@ -111,54 +110,23 @@ bool lzss_decode(const LzssTokenStream *in_stream, ByteBuffer *out)
     // The caller owns the buffer so reuse its allocated storage if available
     out->size = 0;
 
-    bool eof_seen = false;
-    const size_t token_count = in_stream->tokens.size();
-
-    for (size_t i = 0; i < token_count; ++i) {
-        const LzssToken &token = in_stream->tokens[i];
-
-        switch (token.type) {
-        case LZSS_TOKEN_LITERAL:
-            if (eof_seen) {
+    for (const LzssSequence& sequence : in_stream->sequences) {
+        if (sequence.match_length == 0) {
+            if (sequence.match_distance != 0) {
                 return false;
             }
+        } else if (!buffer_copy_match(out,
+                                      sequence.match_distance,
+                                      sequence.match_length)) {
+            return false;
+        }
 
-            if (!buffer_push_back(out, token.literal)) {
-                return false;
-            }
-            break;
-
-        case LZSS_TOKEN_MATCH:
-            if (eof_seen) {
-                return false;
-            }
-
-            // distance is additionally checked inside buffer_copy_match
-            if (token.match.length == 0) {
-                return false;
-            }
-
-            if (!buffer_copy_match(
-                    out,
-                    token.match.distance,
-                    token.match.length)) {
-                return false;
-                    }
-            break;
-
-        case LZSS_TOKEN_EOF:
-            // EOF must occur exactly once and be the final token
-            if (eof_seen || i + 1 != token_count) {
-                return false;
-            }
-
-            eof_seen = true;
-            break;
-
-        default:
+        if (!buffer_append(out,
+                           sequence.literals_ptr,
+                           sequence.lit_length)) {
             return false;
         }
     }
 
-    return eof_seen;
+    return true;
 }

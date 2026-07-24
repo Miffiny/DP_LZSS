@@ -4,11 +4,10 @@
 #include <cstddef>
 #include "token.h"
 
-//Future usage
 typedef enum {
     LZSS_PARSE_GREEDY,
-    LZSS_PARSE_LAZY,
-    LZSS_PARSE_COST_AWARE
+    LZSS_PARSE_LAZY
+    // Future parser work can add a cost-aware mode here.
 } LzssParseMode;
 
 typedef struct {
@@ -20,4 +19,4 @@ typedef struct {
 } LzssConfig;
 
 bool lzss_encode(const uint8_t* input, size_t input_size,
-                 const LzssConfig* config, LzssTokenStream* out_stream);
+                 const LzssConfig* config, LzssSequenceStream* out_stream);
