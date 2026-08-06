@@ -132,10 +132,9 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
 {
     const std::filesystem::path dataset_dir = "datasets";
     const LzssConfig config{
-        65536,
+        1<<16,
         4,
         258,
-        // Future parser work can add a cost-aware mode here.
         LZSS_PARSE_LAZY
     };
 

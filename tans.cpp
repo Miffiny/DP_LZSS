@@ -127,6 +127,7 @@ size_t tans_decode_symbol(struct tans_state *ts, struct bio *bio, const struct t
 }
 
 static constexpr size_t STATIC_MODEL_TOTAL = TANS_L;
+static constexpr size_t REP_DISTANCE_COUNT = 3;
 
 struct DeflateClass {
     uint32_t base;
@@ -216,6 +217,167 @@ static size_t active_class_count(
     }
 
     return active_count;
+}
+
+static bool find_class_for_value(
+    const DeflateClass *classes,
+    size_t class_count,
+    uint32_t min_value,
+    uint32_t max_value,
+    uint32_t value,
+    size_t *out_symbol,
+    const DeflateClass **out_class);
+
+static bool find_class_by_symbol(
+    const DeflateClass *classes,
+    size_t class_count,
+    uint32_t min_value,
+    uint32_t max_value,
+    size_t target_symbol,
+    const DeflateClass **out_class);
+
+struct RepeatDistanceState {
+    uint32_t distances[REP_DISTANCE_COUNT] = {0, 0, 0};
+};
+
+static size_t distance_symbol_count(
+    uint32_t window_size)
+{
+    return REP_DISTANCE_COUNT +
+           active_class_count(
+               DISTANCE_CLASSES,
+               array_count(DISTANCE_CLASSES),
+               1,
+               window_size
+           );
+}
+
+static bool find_repeat_distance_symbol(
+    const RepeatDistanceState *state,
+    uint32_t distance,
+    size_t *out_symbol)
+{
+    if (state == nullptr || out_symbol == nullptr || distance == 0) {
+        return false;
+    }
+
+    for (size_t i = 0; i < REP_DISTANCE_COUNT; ++i) {
+        if (state->distances[i] == distance) {
+            *out_symbol = i;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void update_repeat_distances(
+    RepeatDistanceState *state,
+    uint32_t distance)
+{
+    if (state == nullptr || distance == 0) {
+        return;
+    }
+
+    size_t existing_index = REP_DISTANCE_COUNT;
+    for (size_t i = 0; i < REP_DISTANCE_COUNT; ++i) {
+        if (state->distances[i] == distance) {
+            existing_index = i;
+            break;
+        }
+    }
+
+    const size_t shift_count =
+        existing_index == REP_DISTANCE_COUNT
+            ? REP_DISTANCE_COUNT - 1
+            : existing_index;
+
+    for (size_t i = shift_count; i > 0; --i) {
+        state->distances[i] = state->distances[i - 1];
+    }
+
+    state->distances[0] = distance;
+}
+
+static bool distance_symbol_for_value(
+    const LzssTansCodec *codec,
+    const RepeatDistanceState *repeat_state,
+    uint32_t distance,
+    size_t *out_symbol,
+    const DeflateClass **out_class)
+{
+    if (codec == nullptr ||
+        repeat_state == nullptr ||
+        out_symbol == nullptr ||
+        out_class == nullptr) {
+        return false;
+    }
+
+    size_t repeat_symbol = 0;
+    if (find_repeat_distance_symbol(
+            repeat_state,
+            distance,
+            &repeat_symbol)) {
+        *out_symbol = repeat_symbol;
+        *out_class = nullptr;
+        return true;
+    }
+
+    size_t distance_class_symbol = 0;
+    if (!find_class_for_value(
+            DISTANCE_CLASSES,
+            array_count(DISTANCE_CLASSES),
+            1,
+            static_cast<uint32_t>(codec->config.window_size),
+            distance,
+            &distance_class_symbol,
+            out_class)) {
+        return false;
+    }
+
+    *out_symbol = REP_DISTANCE_COUNT + distance_class_symbol;
+    return true;
+}
+
+static bool distance_value_for_symbol(
+    const LzssTansCodec *codec,
+    const RepeatDistanceState *repeat_state,
+    size_t symbol,
+    const DeflateClass **out_class,
+    uint32_t *out_distance)
+{
+    if (codec == nullptr ||
+        repeat_state == nullptr ||
+        out_class == nullptr ||
+        out_distance == nullptr) {
+        return false;
+    }
+
+    if (symbol < REP_DISTANCE_COUNT) {
+        const uint32_t distance = repeat_state->distances[symbol];
+        if (distance == 0 || distance > codec->config.window_size) {
+            return false;
+        }
+
+        *out_class = nullptr;
+        *out_distance = distance;
+        return true;
+    }
+
+    const DeflateClass *distance_class = nullptr;
+    if (!find_class_by_symbol(
+            DISTANCE_CLASSES,
+            array_count(DISTANCE_CLASSES),
+            1,
+            static_cast<uint32_t>(codec->config.window_size),
+            symbol - REP_DISTANCE_COUNT,
+            &distance_class)) {
+        return false;
+    }
+
+    *out_class = distance_class;
+    *out_distance = 0;
+    return true;
 }
 
 static size_t max_extra_bit_count(
@@ -588,6 +750,7 @@ static bool collect_static_model_stats(
     std::vector<uint32_t> literal_frequencies(codec->literal_model.count, 0);
     std::vector<uint32_t> length_frequencies(codec->length_model.count, 0);
     std::vector<uint32_t> distance_frequencies(codec->distance_model.count, 0);
+    RepeatDistanceState repeat_state{};
 
     for (size_t i = 0; i < stream->sequences.size(); ++i) {
         const LzssSequence& sequence = stream->sequences[i];
@@ -636,11 +799,9 @@ static bool collect_static_model_stats(
         size_t distance_symbol = 0;
         const DeflateClass *distance_class = nullptr;
 
-        if (!find_class_for_value(
-                DISTANCE_CLASSES,
-                array_count(DISTANCE_CLASSES),
-                1,
-                static_cast<uint32_t>(codec->config.window_size),
+        if (!distance_symbol_for_value(
+                codec,
+                &repeat_state,
                 sequence.match_distance,
                 &distance_symbol,
                 &distance_class)) {
@@ -651,6 +812,7 @@ static bool collect_static_model_stats(
         (void)distance_class;
         length_frequencies[length_symbol]++;
         distance_frequencies[distance_symbol]++;
+        update_repeat_distances(&repeat_state, sequence.match_distance);
     }
 
     return model_set_frequencies_tans(
@@ -756,8 +918,13 @@ static bool encode_literal_length_extras(
 static bool encode_match_extras(
     LzssTansCodec *codec,
     struct bio *extra_bio,
+    RepeatDistanceState *repeat_state,
     const LzssSequence *sequence)
 {
+    if (repeat_state == nullptr) {
+        return false;
+    }
+
     size_t length_symbol = 0;
     const DeflateClass *length_class = nullptr;
 
@@ -782,23 +949,25 @@ static bool encode_match_extras(
     size_t distance_symbol = 0;
     const DeflateClass *distance_class = nullptr;
 
-    if (!find_class_for_value(
-            DISTANCE_CLASSES,
-            array_count(DISTANCE_CLASSES),
-            1,
-            static_cast<uint32_t>(codec->config.window_size),
+    if (!distance_symbol_for_value(
+            codec,
+            repeat_state,
             sequence->match_distance,
             &distance_symbol,
             &distance_class)) {
         return false;
     }
 
+    if (distance_class != nullptr) {
+        bio_write_bits(
+            extra_bio,
+            sequence->match_distance - distance_class->base,
+            distance_class->extra_bits
+        );
+    }
+
     (void)distance_symbol;
-    bio_write_bits(
-        extra_bio,
-        sequence->match_distance - distance_class->base,
-        distance_class->extra_bits
-    );
+    update_repeat_distances(repeat_state, sequence->match_distance);
 
     return true;
 }
@@ -843,7 +1012,8 @@ static bool encode_match_symbols_reverse(
     LzssTansCodec *codec,
     struct tans_state *state,
     std::vector<struct tans_bit_chunk> *chunks,
-    const LzssSequence *sequence)
+    const LzssSequence *sequence,
+    size_t distance_symbol)
 {
     size_t length_symbol = 0;
     const DeflateClass *length_class = nullptr;
@@ -860,23 +1030,12 @@ static bool encode_match_symbols_reverse(
         return false;
     }
 
-    size_t distance_symbol = 0;
-    const DeflateClass *distance_class = nullptr;
-
     if (!codec->distance_tans_ready ||
-        !find_class_for_value(
-            DISTANCE_CLASSES,
-            array_count(DISTANCE_CLASSES),
-            1,
-            static_cast<uint32_t>(codec->config.window_size),
-            sequence->match_distance,
-            &distance_symbol,
-            &distance_class)) {
+        distance_symbol >= codec->distance_model.count) {
         return false;
     }
 
     (void)length_class;
-    (void)distance_class;
     chunks->push_back(
         tans_encode_symbol_to_chunk(
             state,
@@ -995,9 +1154,11 @@ static bool decode_distance_symbol(
     struct tans_state *state,
     struct bio *tans_bio,
     struct bio *extra_bio,
+    RepeatDistanceState *repeat_state,
     uint32_t *out_distance)
 {
-    if (!codec->distance_tans_ready) {
+    if (!codec->distance_tans_ready ||
+        repeat_state == nullptr) {
         return false;
     }
 
@@ -1009,32 +1170,35 @@ static bool decode_distance_symbol(
     }
 
     const DeflateClass *distance_class = nullptr;
+    uint32_t distance = 0;
 
-    if (!find_class_by_symbol(
-            DISTANCE_CLASSES,
-            array_count(DISTANCE_CLASSES),
-            1,
-            static_cast<uint32_t>(codec->config.window_size),
+    if (!distance_value_for_symbol(
+            codec,
+            repeat_state,
             distance_symbol,
-            &distance_class)) {
+            &distance_class,
+            &distance)) {
         return false;
     }
 
-    const uint32_t extra_value = distance_class->extra_bits == 0
-        ? 0
-        : bio_read_bits(extra_bio, distance_class->extra_bits);
+    if (distance_class != nullptr) {
+        const uint32_t extra_value = distance_class->extra_bits == 0
+            ? 0
+            : bio_read_bits(extra_bio, distance_class->extra_bits);
 
-    if (extra_value >= distance_class->size) {
-        return false;
+        if (extra_value >= distance_class->size) {
+            return false;
+        }
+
+        distance = distance_class->base + extra_value;
     }
-
-    const uint32_t distance = distance_class->base + extra_value;
 
     if (distance == 0 || distance > codec->config.window_size) {
         return false;
     }
 
     *out_distance = distance;
+    update_repeat_distances(repeat_state, distance);
     return true;
 }
 
@@ -1058,12 +1222,7 @@ bool lzss_tans_codec_init(
         );
 
     const size_t distance_class_count =
-        active_class_count(
-            DISTANCE_CLASSES,
-            array_count(DISTANCE_CLASSES),
-            1,
-            static_cast<uint32_t>(config->window_size)
-        );
+        distance_symbol_count(static_cast<uint32_t>(config->window_size));
 
     const size_t literal_length_class_count =
         active_class_count(
@@ -1158,6 +1317,8 @@ bool lzss_tans_encode_stream(
 
     size_t symbol_count = stream->sequences.size();
     size_t extra_bit_capacity = 32;
+    std::vector<size_t> distance_symbols;
+    RepeatDistanceState symbol_repeat_state{};
 
     for (size_t i = 0; i < stream->sequences.size(); ++i) {
         const LzssSequence& sequence = stream->sequences[i];
@@ -1178,6 +1339,20 @@ bool lzss_tans_encode_stream(
         if (i == 0) {
             continue;
         }
+
+        size_t distance_symbol = 0;
+        const DeflateClass *distance_class = nullptr;
+        if (!distance_symbol_for_value(
+                codec,
+                &symbol_repeat_state,
+                sequence.match_distance,
+                &distance_symbol,
+                &distance_class)) {
+            return false;
+        }
+        (void)distance_class;
+        distance_symbols.push_back(distance_symbol);
+        update_repeat_distances(&symbol_repeat_state, sequence.match_distance);
 
         if (symbol_count >
             std::numeric_limits<size_t>::max() - 2) {
@@ -1212,11 +1387,16 @@ bool lzss_tans_encode_stream(
         BIO_MODE_WRITE
     );
 
+    RepeatDistanceState extra_repeat_state{};
     for (size_t i = 0; i < stream->sequences.size(); ++i) {
         const LzssSequence *sequence = &stream->sequences[i];
 
         if (i > 0 &&
-            !encode_match_extras(codec, &extra_writer, sequence)) {
+            !encode_match_extras(
+                codec,
+                &extra_writer,
+                &extra_repeat_state,
+                sequence)) {
             return false;
         }
 
@@ -1228,6 +1408,7 @@ bool lzss_tans_encode_stream(
     struct tans_state state{};
     tans_encode_init(&state);
 
+    size_t distance_symbol_index = distance_symbols.size();
     for (size_t i = stream->sequences.size(); i > 0; --i) {
         const size_t sequence_index = i - 1;
         const LzssSequence *sequence = &stream->sequences[sequence_index];
@@ -1259,14 +1440,27 @@ bool lzss_tans_encode_stream(
             return false;
         }
 
-        if (sequence_index > 0 &&
-            !encode_match_symbols_reverse(
-                codec,
-                &state,
-                &tans_chunks,
-                sequence)) {
-            return false;
+        if (sequence_index > 0) {
+            if (distance_symbol_index == 0) {
+                return false;
+            }
+
+            const size_t distance_symbol =
+                distance_symbols[--distance_symbol_index];
+
+            if (!encode_match_symbols_reverse(
+                    codec,
+                    &state,
+                    &tans_chunks,
+                    sequence,
+                    distance_symbol)) {
+                return false;
+            }
         }
+    }
+
+    if (distance_symbol_index != 0) {
+        return false;
     }
 
     bio_close(&extra_writer, BIO_MODE_WRITE);
@@ -1386,6 +1580,7 @@ bool lzss_tans_decode_stream(
 
     std::vector<size_t> literal_offsets;
     literal_offsets.reserve(sequence_count);
+    RepeatDistanceState repeat_state{};
 
     for (uint32_t i = 0; i < sequence_count; ++i) {
         LzssSequence sequence{};
@@ -1405,6 +1600,7 @@ bool lzss_tans_decode_stream(
                     &state,
                     &tans_reader,
                     &extra_reader,
+                    &repeat_state,
                     &sequence.match_distance)) {
                 return false;
             }
