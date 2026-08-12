@@ -48,6 +48,8 @@ size_t tans_decode_symbol(struct tans_state *ts, struct bio *bio, const struct t
 #include "parser.h"
 #include "token.h"
 
+#include <vector>
+
 struct LzssTansCodec {
     LzssConfig config;
 
@@ -71,6 +73,19 @@ struct LzssTansCodec {
     bool distance_tans_ready;
 };
 
+struct LzssTansCostModel {
+    std::vector<double> literal_costs;
+    std::vector<double> literal_length_costs;
+    std::vector<double> length_costs;
+    std::vector<double> distance_symbol_costs;
+    std::vector<double> distance_costs;
+    double match_sequence_cost;
+};
+
+struct LzssRepeatDistanceState {
+    uint32_t distances[3] = {0, 0, 0};
+};
+
 bool lzss_tans_codec_init(
     LzssTansCodec *codec,
     const LzssConfig *config
@@ -84,6 +99,47 @@ bool lzss_tans_encode_stream(
     LzssTansCodec *codec,
     struct bio *bio,
     const LzssSequenceStream *stream
+);
+
+bool lzss_tans_build_models(
+    LzssTansCodec *codec,
+    const LzssSequenceStream *stream,
+    bool smooth_all_symbols
+);
+
+bool lzss_tans_encode_stream_with_current_models(
+    LzssTansCodec *codec,
+    struct bio *bio,
+    const LzssSequenceStream *stream
+);
+
+bool lzss_tans_cost_model_init(
+    const LzssTansCodec *codec,
+    LzssTansCostModel *cost_model
+);
+
+void lzss_repeat_distance_state_init(
+    LzssRepeatDistanceState *state
+);
+
+void lzss_repeat_distance_state_update(
+    LzssRepeatDistanceState *state,
+    uint32_t distance
+);
+
+bool lzss_tans_literal_length_cost(
+    const LzssTansCostModel *cost_model,
+    size_t literal_length,
+    double *out_cost
+);
+
+bool lzss_tans_match_cost(
+    const LzssTansCostModel *cost_model,
+    const LzssRepeatDistanceState *repeat_state,
+    uint32_t match_length,
+    uint32_t match_distance,
+    double *out_cost,
+    LzssRepeatDistanceState *out_repeat_state
 );
 
 bool lzss_tans_decode_stream(

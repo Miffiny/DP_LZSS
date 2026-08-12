@@ -1,5 +1,6 @@
 #include "tans.h"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <limits>
@@ -179,6 +180,10 @@ static const DeflateClass DISTANCE_CLASSES[] = {
     {8193, 4096, 12}, {12289, 4096, 12},
     {16385, 8192, 13}, {24577, 8192, 13},
     {32769, 16384, 14}, {49153, 16384, 14},
+    {65537, 32768, 15}, {98305, 32768, 15},
+    {131073, 65536, 16}, {196609, 65536, 16},
+    {262145, 131072, 17}, {393217, 131072, 17},
+    {524289, 262144, 18}, {786433, 262144, 18},
 };
 
 template <typename T, size_t N>
@@ -236,9 +241,7 @@ static bool find_class_by_symbol(
     size_t target_symbol,
     const DeflateClass **out_class);
 
-struct RepeatDistanceState {
-    uint32_t distances[REP_DISTANCE_COUNT] = {0, 0, 0};
-};
+using RepeatDistanceState = LzssRepeatDistanceState;
 
 static size_t distance_symbol_count(
     uint32_t window_size)
@@ -297,6 +300,25 @@ static void update_repeat_distances(
     }
 
     state->distances[0] = distance;
+}
+
+void lzss_repeat_distance_state_init(
+    LzssRepeatDistanceState *state)
+{
+    if (state == nullptr) {
+        return;
+    }
+
+    for (uint32_t& distance : state->distances) {
+        distance = 0;
+    }
+}
+
+void lzss_repeat_distance_state_update(
+    LzssRepeatDistanceState *state,
+    uint32_t distance)
+{
+    update_repeat_distances(state, distance);
 }
 
 static bool distance_symbol_for_value(
@@ -737,7 +759,8 @@ static bool read_static_model_header(
 
 static bool collect_static_model_stats(
     LzssTansCodec *codec,
-    const LzssSequenceStream *stream)
+    const LzssSequenceStream *stream,
+    bool smooth_all_symbols)
 {
     if (codec == nullptr || !sequence_layout_is_valid(codec, stream)) {
         return false;
@@ -815,6 +838,29 @@ static bool collect_static_model_stats(
         update_repeat_distances(&repeat_state, sequence.match_distance);
     }
 
+    if (smooth_all_symbols) {
+        for (uint32_t& frequency : literal_length_frequencies) {
+            if (frequency == 0) {
+                frequency = 1;
+            }
+        }
+        for (uint32_t& frequency : literal_frequencies) {
+            if (frequency == 0) {
+                frequency = 1;
+            }
+        }
+        for (uint32_t& frequency : length_frequencies) {
+            if (frequency == 0) {
+                frequency = 1;
+            }
+        }
+        for (uint32_t& frequency : distance_frequencies) {
+            if (frequency == 0) {
+                frequency = 1;
+            }
+        }
+    }
+
     return model_set_frequencies_tans(
                &codec->literal_length_model,
                literal_length_frequencies) &&
@@ -885,6 +931,24 @@ static void destroy_tans_models(LzssTansCodec *codec)
     codec->literal_tans_ready = false;
     codec->length_tans_ready = false;
     codec->distance_tans_ready = false;
+}
+
+static double model_symbol_cost(
+    const struct model *model,
+    size_t symbol)
+{
+    if (model == nullptr ||
+        model->table == nullptr ||
+        symbol >= model->count ||
+        model->total == 0 ||
+        model->table[symbol].freq == 0) {
+        return std::numeric_limits<double>::infinity();
+    }
+
+    return std::log2(
+        static_cast<double>(model->total) /
+        static_cast<double>(model->table[symbol].freq)
+    );
 }
 
 static bool encode_literal_length_extras(
@@ -1297,6 +1361,33 @@ bool lzss_tans_encode_stream(
     struct bio *bio,
     const LzssSequenceStream *stream)
 {
+    if (!lzss_tans_build_models(codec, stream, false)) {
+        return false;
+    }
+
+    return lzss_tans_encode_stream_with_current_models(codec, bio, stream);
+}
+
+bool lzss_tans_build_models(
+    LzssTansCodec *codec,
+    const LzssSequenceStream *stream,
+    bool smooth_all_symbols)
+{
+    if (codec == nullptr ||
+        stream == nullptr) {
+        return false;
+    }
+
+    destroy_tans_models(codec);
+    return collect_static_model_stats(codec, stream, smooth_all_symbols) &&
+           init_all_tans_models(codec);
+}
+
+bool lzss_tans_encode_stream_with_current_models(
+    LzssTansCodec *codec,
+    struct bio *bio,
+    const LzssSequenceStream *stream)
+{
     if (codec == nullptr ||
         bio == nullptr ||
         stream == nullptr) {
@@ -1308,10 +1399,9 @@ bool lzss_tans_encode_stream(
         return false;
     }
 
-    if (!collect_static_model_stats(codec, stream) ||
+    if (!sequence_layout_is_valid(codec, stream) ||
         !write_u32(bio, sequence_count_u32) ||
-        !write_static_model_header(bio, codec) ||
-        !init_all_tans_models(codec)) {
+        !write_static_model_header(bio, codec)) {
         return false;
     }
 
@@ -1515,6 +1605,216 @@ bool lzss_tans_encode_stream(
         write_u32(bio, extra_words[i]);
     }
 
+    return true;
+}
+
+bool lzss_tans_cost_model_init(
+    const LzssTansCodec *codec,
+    LzssTansCostModel *cost_model)
+{
+    if (codec == nullptr ||
+        cost_model == nullptr ||
+        !is_valid_config(&codec->config)) {
+        return false;
+    }
+
+    cost_model->literal_costs.assign(256, 0.0);
+    cost_model->literal_length_costs.assign(
+        codec->literal_length_model.count,
+        std::numeric_limits<double>::infinity()
+    );
+    cost_model->length_costs.assign(
+        codec->config.max_match_length + 1,
+        std::numeric_limits<double>::infinity()
+    );
+    cost_model->distance_symbol_costs.assign(
+        codec->distance_model.count,
+        std::numeric_limits<double>::infinity()
+    );
+    cost_model->distance_costs.assign(
+        codec->config.window_size + 1,
+        std::numeric_limits<double>::infinity()
+    );
+
+    for (size_t symbol = 0; symbol < cost_model->literal_costs.size();
+         ++symbol) {
+        cost_model->literal_costs[symbol] =
+            model_symbol_cost(&codec->literal_model, symbol);
+    }
+
+    for (size_t symbol = 0; symbol < cost_model->literal_length_costs.size();
+         ++symbol) {
+        cost_model->literal_length_costs[symbol] =
+            model_symbol_cost(&codec->literal_length_model, symbol);
+    }
+
+    for (size_t length = codec->config.min_match_length;
+         length <= codec->config.max_match_length;
+         ++length) {
+        size_t length_symbol = 0;
+        const DeflateClass *length_class = nullptr;
+
+        if (!find_class_for_value(
+                LENGTH_CLASSES,
+                array_count(LENGTH_CLASSES),
+                static_cast<uint32_t>(codec->config.min_match_length),
+                static_cast<uint32_t>(codec->config.max_match_length),
+                static_cast<uint32_t>(length),
+                &length_symbol,
+                &length_class)) {
+            return false;
+        }
+
+        cost_model->length_costs[length] =
+            model_symbol_cost(&codec->length_model, length_symbol) +
+            static_cast<double>(length_class->extra_bits);
+    }
+
+    for (size_t symbol = 0; symbol < cost_model->distance_symbol_costs.size();
+         ++symbol) {
+        cost_model->distance_symbol_costs[symbol] =
+            model_symbol_cost(&codec->distance_model, symbol);
+    }
+
+    for (size_t distance = 1;
+         distance <= codec->config.window_size;
+         ++distance) {
+        size_t distance_class_symbol = 0;
+        const DeflateClass *distance_class = nullptr;
+
+        if (!find_class_for_value(
+                DISTANCE_CLASSES,
+                array_count(DISTANCE_CLASSES),
+                1,
+                static_cast<uint32_t>(codec->config.window_size),
+                static_cast<uint32_t>(distance),
+                &distance_class_symbol,
+                &distance_class)) {
+            return false;
+        }
+
+        const size_t distance_symbol =
+            REP_DISTANCE_COUNT + distance_class_symbol;
+        cost_model->distance_costs[distance] =
+            model_symbol_cost(&codec->distance_model, distance_symbol) +
+            static_cast<double>(distance_class->extra_bits);
+    }
+
+    size_t literal_length_zero_symbol = 0;
+    const DeflateClass *literal_length_zero_class = nullptr;
+    if (!find_class_for_value(
+            LITERAL_LENGTH_CLASSES,
+            array_count(LITERAL_LENGTH_CLASSES),
+            0,
+            UINT32_MAX,
+            0,
+            &literal_length_zero_symbol,
+            &literal_length_zero_class)) {
+        return false;
+    }
+
+    cost_model->match_sequence_cost =
+        model_symbol_cost(
+            &codec->literal_length_model,
+            literal_length_zero_symbol
+        ) +
+        static_cast<double>(literal_length_zero_class->extra_bits);
+
+    return true;
+}
+
+bool lzss_tans_literal_length_cost(
+    const LzssTansCostModel *cost_model,
+    size_t literal_length,
+    double *out_cost)
+{
+    if (cost_model == nullptr ||
+        out_cost == nullptr ||
+        literal_length > UINT32_MAX) {
+        return false;
+    }
+
+    size_t literal_length_symbol = 0;
+    const DeflateClass *literal_length_class = nullptr;
+    if (!find_class_for_value(
+            LITERAL_LENGTH_CLASSES,
+            array_count(LITERAL_LENGTH_CLASSES),
+            0,
+            UINT32_MAX,
+            static_cast<uint32_t>(literal_length),
+            &literal_length_symbol,
+            &literal_length_class) ||
+        literal_length_symbol >= cost_model->literal_length_costs.size()) {
+        return false;
+    }
+
+    *out_cost =
+        cost_model->literal_length_costs[literal_length_symbol] +
+        static_cast<double>(literal_length_class->extra_bits);
+    return std::isfinite(*out_cost);
+}
+
+bool lzss_tans_match_cost(
+    const LzssTansCostModel *cost_model,
+    const LzssRepeatDistanceState *repeat_state,
+    uint32_t match_length,
+    uint32_t match_distance,
+    double *out_cost,
+    LzssRepeatDistanceState *out_repeat_state)
+{
+    if (cost_model == nullptr ||
+        repeat_state == nullptr ||
+        out_cost == nullptr ||
+        out_repeat_state == nullptr ||
+        match_length >= cost_model->length_costs.size() ||
+        match_distance == 0) {
+        return false;
+    }
+
+    size_t distance_symbol = 0;
+    const DeflateClass *distance_class = nullptr;
+    double distance_cost = 0.0;
+
+    if (find_repeat_distance_symbol(
+            repeat_state,
+            match_distance,
+            &distance_symbol)) {
+        if (distance_symbol >= cost_model->distance_symbol_costs.size()) {
+            return false;
+        }
+
+        distance_cost = cost_model->distance_symbol_costs[distance_symbol];
+    } else {
+        size_t distance_class_symbol = 0;
+        if (match_distance >= cost_model->distance_costs.size() ||
+            !find_class_for_value(
+                DISTANCE_CLASSES,
+                array_count(DISTANCE_CLASSES),
+                1,
+                static_cast<uint32_t>(cost_model->distance_costs.size() - 1),
+                match_distance,
+                &distance_class_symbol,
+                &distance_class)) {
+            return false;
+        }
+
+        distance_symbol = REP_DISTANCE_COUNT + distance_class_symbol;
+        if (distance_symbol >= cost_model->distance_symbol_costs.size()) {
+            return false;
+        }
+
+        distance_cost =
+            cost_model->distance_symbol_costs[distance_symbol] +
+            static_cast<double>(distance_class->extra_bits);
+    }
+
+    *out_cost = cost_model->length_costs[match_length] + distance_cost;
+    if (!std::isfinite(*out_cost)) {
+        return false;
+    }
+
+    *out_repeat_state = *repeat_state;
+    lzss_repeat_distance_state_update(out_repeat_state, match_distance);
     return true;
 }
 

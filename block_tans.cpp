@@ -1,5 +1,6 @@
 #include "block_tans.h"
 
+#include "LZSS/optimal_parser.h"
 #include "tans.h"
 
 #include <algorithm>
@@ -9,8 +10,6 @@
 #include <thread>
 #include <utility>
 #include <vector>
-
-static constexpr size_t LZSS_TANS_MAX_WORKERS = 8;
 
 struct TansCodecGuard {
     LzssTansCodec codec{};
@@ -65,9 +64,9 @@ static size_t block_uncompressed_size(
     return block_size;
 }
 
-static size_t worker_count_for(size_t block_count)
+static size_t worker_count_for(size_t block_count, size_t max_workers)
 {
-    if (block_count == 0) {
+    if (block_count == 0 || max_workers == 0) {
         return 0;
     }
 
@@ -75,7 +74,7 @@ static size_t worker_count_for(size_t block_count)
     const size_t hardware_count =
         hardware_threads == 0 ? 1 : static_cast<size_t>(hardware_threads);
 
-    return std::min({block_count, hardware_count, LZSS_TANS_MAX_WORKERS});
+    return std::min({block_count, hardware_count, max_workers});
 }
 
 static void collect_sequence_stats(
@@ -125,42 +124,87 @@ static bool ensure_buffer_capacity(ByteBuffer *buffer, size_t needed)
 static bool encode_one_block(
     const uint8_t *input,
     size_t input_size,
+    size_t block_size,
     size_t block_count,
     size_t block_index,
     const LzssConfig *config,
     EncodedBlockResult *result)
 {
-    const size_t block_offset = block_index * LZSS_TANS_BLOCK_SIZE;
-    const size_t block_size = block_uncompressed_size(
+    const size_t block_offset = block_index * block_size;
+    const size_t current_block_size = block_uncompressed_size(
         input_size,
-        LZSS_TANS_BLOCK_SIZE,
+        block_size,
         block_count,
         block_index
     );
     const uint8_t *block_input =
-        block_size == 0 ? nullptr : input + block_offset;
+        current_block_size == 0 ? nullptr : input + block_offset;
 
     LzssSequenceStream sequence_stream;
     sequence_stream_init(&sequence_stream, 0);
-
-    if (!lzss_encode(block_input, block_size, config, &sequence_stream)) {
-        sequence_stream_free(&sequence_stream);
-        return false;
-    }
-
-    collect_sequence_stats(sequence_stream, &result->stats);
-
-    const size_t word_count = std::max<size_t>(
-        1024,
-        sequence_stream.sequences.size() * 8 + block_size + 64
-    );
-    std::vector<uint32_t> compressed_words(word_count, 0);
 
     TansCodecGuard codec;
     if (!codec.init(config)) {
         sequence_stream_free(&sequence_stream);
         return false;
     }
+
+    bool use_current_models = false;
+
+    if (config->parse_mode == LZSS_PARSE_OPTIMAL) {
+        LzssConfig seed_config = *config;
+        seed_config.parse_mode = LZSS_PARSE_LAZY;
+
+        LzssSequenceStream seed_stream;
+        sequence_stream_init(&seed_stream, 0);
+
+        const bool seed_ok =
+            lzss_encode(
+                block_input,
+                current_block_size,
+                &seed_config,
+                &seed_stream
+            );
+
+        LzssTansCostModel cost_model;
+        const bool optimal_ok =
+            seed_ok &&
+            lzss_tans_build_models(&codec.codec, &seed_stream, true) &&
+            lzss_tans_cost_model_init(&codec.codec, &cost_model) &&
+            lzss_encode_optimal(
+                block_input,
+                current_block_size,
+                config,
+                &cost_model,
+                &sequence_stream
+            );
+
+        sequence_stream_free(&seed_stream);
+
+        if (!optimal_ok) {
+            sequence_stream_free(&sequence_stream);
+            return false;
+        }
+
+        use_current_models = true;
+    } else {
+        if (!lzss_encode(
+                block_input,
+                current_block_size,
+                config,
+                &sequence_stream)) {
+            sequence_stream_free(&sequence_stream);
+            return false;
+        }
+    }
+
+    collect_sequence_stats(sequence_stream, &result->stats);
+
+    const size_t word_count = std::max<size_t>(
+        1024,
+        sequence_stream.sequences.size() * 8 + current_block_size + 64
+    );
+    std::vector<uint32_t> compressed_words(word_count, 0);
 
     bio writer{};
     bio_open(
@@ -170,11 +214,17 @@ static bool encode_one_block(
         BIO_MODE_WRITE
     );
 
-    const bool encoded = lzss_tans_encode_stream(
-        &codec.codec,
-        &writer,
-        &sequence_stream
-    );
+    const bool encoded = use_current_models
+        ? lzss_tans_encode_stream_with_current_models(
+              &codec.codec,
+              &writer,
+              &sequence_stream
+          )
+        : lzss_tans_encode_stream(
+              &codec.codec,
+              &writer,
+              &sequence_stream
+          );
     bio_close(&writer, BIO_MODE_WRITE);
 
     sequence_stream_free(&sequence_stream);
@@ -261,7 +311,7 @@ void lzss_tans_block_stream_init(LzssTansBlockStream *stream)
     }
 
     stream->original_size = 0;
-    stream->block_size = LZSS_TANS_BLOCK_SIZE;
+    stream->block_size = LZSS_TANS_DEFAULT_BLOCK_SIZE;
     stream->blocks.clear();
     stream->stats = {};
 }
@@ -273,7 +323,7 @@ void lzss_tans_block_stream_clear(LzssTansBlockStream *stream)
     }
 
     LzssTansBlockStream empty{};
-    empty.block_size = LZSS_TANS_BLOCK_SIZE;
+    empty.block_size = LZSS_TANS_DEFAULT_BLOCK_SIZE;
     *stream = std::move(empty);
 }
 
@@ -295,10 +345,14 @@ size_t lzss_tans_block_stream_compressed_size(
 bool lzss_tans_encode_blocks(
     const uint8_t *input,
     size_t input_size,
+    size_t block_size,
+    size_t max_workers,
     const LzssConfig *config,
     LzssTansBlockStream *out_stream)
 {
     if ((input_size > 0 && input == nullptr) ||
+        block_size == 0 ||
+        max_workers == 0 ||
         config == nullptr ||
         out_stream == nullptr) {
         return false;
@@ -306,18 +360,18 @@ bool lzss_tans_encode_blocks(
 
     try {
         const size_t block_count =
-            block_count_for_size(input_size, LZSS_TANS_BLOCK_SIZE);
+            block_count_for_size(input_size, block_size);
 
         LzssTansBlockStream working{};
         working.original_size = input_size;
-        working.block_size = LZSS_TANS_BLOCK_SIZE;
+        working.block_size = block_size;
         working.blocks.resize(block_count);
 
         std::vector<EncodedBlockResult> results(block_count);
         std::atomic<size_t> next_block{0};
         std::atomic<bool> ok{true};
 
-        const size_t worker_count = worker_count_for(block_count);
+        const size_t worker_count = worker_count_for(block_count, max_workers);
         std::vector<std::thread> workers;
         workers.reserve(worker_count);
 
@@ -335,6 +389,7 @@ bool lzss_tans_encode_blocks(
                         if (!encode_one_block(
                                 input,
                                 input_size,
+                                block_size,
                                 block_count,
                                 block_index,
                                 config,
@@ -374,12 +429,14 @@ bool lzss_tans_encode_blocks(
 
 bool lzss_tans_decode_blocks(
     const LzssTansBlockStream *stream,
+    size_t max_workers,
     const LzssConfig *config,
     ByteBuffer *out)
 {
     if (stream == nullptr ||
         config == nullptr ||
         out == nullptr ||
+        max_workers == 0 ||
         stream->block_size == 0) {
         return false;
     }
@@ -399,7 +456,8 @@ bool lzss_tans_decode_blocks(
         std::atomic<size_t> next_block{0};
         std::atomic<bool> ok{true};
 
-        const size_t worker_count = worker_count_for(stream->blocks.size());
+        const size_t worker_count =
+            worker_count_for(stream->blocks.size(), max_workers);
         std::vector<std::thread> workers;
         workers.reserve(worker_count);
 

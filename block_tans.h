@@ -7,7 +7,8 @@
 #include <cstdint>
 #include <vector>
 
-static constexpr size_t LZSS_TANS_BLOCK_SIZE = 8u * 1024u * 1024u;
+static constexpr size_t LZSS_TANS_DEFAULT_BLOCK_SIZE = 8u * 1024u * 1024u;
+static constexpr size_t LZSS_TANS_DEFAULT_MAX_WORKERS = 8;
 
 struct LzssBlockStats {
     size_t token_count;
@@ -37,10 +38,13 @@ size_t lzss_tans_block_stream_compressed_size(
 bool lzss_tans_encode_blocks(
     const uint8_t *input,
     size_t input_size,
+    size_t block_size,
+    size_t max_workers,
     const LzssConfig *config,
     LzssTansBlockStream *out_stream);
 
 bool lzss_tans_decode_blocks(
     const LzssTansBlockStream *stream,
+    size_t max_workers,
     const LzssConfig *config,
     ByteBuffer *out);

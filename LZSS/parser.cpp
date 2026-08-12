@@ -63,9 +63,15 @@ static bool should_emit_literal_for_lazy_match(LzssMatchFinder* mf,
 bool lzss_encode(const uint8_t* input, size_t input_size,
                  const LzssConfig* config, LzssSequenceStream* out_stream) {
 
-    if ((input_size > 0 && !input) || !config || !out_stream) return false;
+    if ((input_size > 0 && !input) ||
+        !config ||
+        !out_stream ||
+        config->parse_mode == LZSS_PARSE_OPTIMAL) {
+        return false;
+    }
 
-    LzssMatchFinder* mf = match_finder_create(config->window_size);
+    LzssMatchFinder* mf =
+        match_finder_create(config->window_size, config->hash_mode);
     if (!mf) return false;
 
     size_t pos = 0;

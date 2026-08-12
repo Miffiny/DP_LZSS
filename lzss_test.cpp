@@ -3,13 +3,24 @@
 #include "block_tans.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <ostream>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+struct BenchmarkConfig {
+    std::filesystem::path dataset_dir;
+    LzssConfig lzss;
+    size_t block_size;
+    size_t max_workers;
+};
 
 struct CompressionResult {
     bool ok;
@@ -26,6 +37,217 @@ struct CompressionResult {
 static const char *default_entropy_codec_name()
 {
     return "tans";
+}
+
+static std::string trim(const std::string& value)
+{
+    size_t first = 0;
+    while (first < value.size() &&
+           std::isspace(static_cast<unsigned char>(value[first]))) {
+        ++first;
+    }
+
+    size_t last = value.size();
+    while (last > first &&
+           std::isspace(static_cast<unsigned char>(value[last - 1]))) {
+        --last;
+    }
+
+    return value.substr(first, last - first);
+}
+
+static std::string to_lower(std::string value)
+{
+    for (char& ch : value) {
+        ch = static_cast<char>(
+            std::tolower(static_cast<unsigned char>(ch))
+        );
+    }
+    return value;
+}
+
+static bool parse_size(
+    const std::unordered_map<std::string, std::string>& values,
+    const char *key,
+    size_t *out,
+    std::ostream& err)
+{
+    const auto it = values.find(key);
+    if (it == values.end() || it->second.empty()) {
+        err << "Missing config value: " << key << '\n';
+        return false;
+    }
+
+    char *end = nullptr;
+    const unsigned long long parsed =
+        std::strtoull(it->second.c_str(), &end, 10);
+
+    if (end == it->second.c_str() || *end != '\0' ||
+        parsed > std::numeric_limits<size_t>::max()) {
+        err << "Invalid numeric config value: " << key << '='
+            << it->second << '\n';
+        return false;
+    }
+
+    *out = static_cast<size_t>(parsed);
+    return true;
+}
+
+static bool parse_parse_mode(
+    const std::unordered_map<std::string, std::string>& values,
+    LzssParseMode *out,
+    std::ostream& err)
+{
+    const auto it = values.find("parse_mode");
+    if (it == values.end() || it->second.empty()) {
+        err << "Missing config value: parse_mode\n";
+        return false;
+    }
+
+    const std::string value = to_lower(it->second);
+    if (value == "greedy") {
+        *out = LZSS_PARSE_GREEDY;
+        return true;
+    }
+    if (value == "lazy") {
+        *out = LZSS_PARSE_LAZY;
+        return true;
+    }
+    if (value == "optimal") {
+        *out = LZSS_PARSE_OPTIMAL;
+        return true;
+    }
+
+    err << "Invalid parse_mode config value: " << it->second << '\n';
+    return false;
+}
+
+static const char *parse_mode_name(LzssParseMode parse_mode)
+{
+    switch (parse_mode) {
+    case LZSS_PARSE_GREEDY:
+        return "greedy";
+    case LZSS_PARSE_LAZY:
+        return "lazy";
+    case LZSS_PARSE_OPTIMAL:
+        return "optimal";
+    }
+
+    return "unknown";
+}
+
+static bool parse_hash_mode(
+    const std::unordered_map<std::string, std::string>& values,
+    LzssHashMode *out,
+    std::ostream& err)
+{
+    const auto it = values.find("hash_mode");
+    if (it == values.end() || it->second.empty()) {
+        err << "Missing config value: hash_mode\n";
+        return false;
+    }
+
+    const std::string value = to_lower(it->second);
+    if (value == "hash3") {
+        *out = LZSS_HASH3;
+        return true;
+    }
+    if (value == "hash4") {
+        *out = LZSS_HASH4;
+        return true;
+    }
+
+    err << "Invalid hash_mode config value: " << it->second << '\n';
+    return false;
+}
+
+static const char *hash_mode_name(LzssHashMode hash_mode)
+{
+    return hash_mode == LZSS_HASH3 ? "hash3" : "hash4";
+}
+
+static bool load_benchmark_config(
+    const std::filesystem::path& path,
+    BenchmarkConfig *config,
+    std::ostream& err)
+{
+    std::ifstream file(path);
+    if (!file) {
+        err << "Config file not found: " << path.string() << '\n';
+        return false;
+    }
+
+    std::unordered_map<std::string, std::string> values;
+    std::string line;
+    size_t line_number = 0;
+
+    while (std::getline(file, line)) {
+        ++line_number;
+        const size_t comment = line.find('#');
+        if (comment != std::string::npos) {
+            line.erase(comment);
+        }
+
+        line = trim(line);
+        if (line.empty()) {
+            continue;
+        }
+
+        const size_t separator = line.find('=');
+        if (separator == std::string::npos) {
+            err << "Invalid config line " << line_number << ": "
+                << line << '\n';
+            return false;
+        }
+
+        const std::string key = trim(line.substr(0, separator));
+        const std::string value = trim(line.substr(separator + 1));
+        if (key.empty()) {
+            err << "Invalid empty config key on line " << line_number << '\n';
+            return false;
+        }
+
+        values[key] = value;
+    }
+
+    const auto dataset_it = values.find("dataset_dir");
+    if (dataset_it == values.end() || dataset_it->second.empty()) {
+        err << "Missing config value: dataset_dir\n";
+        return false;
+    }
+
+    config->dataset_dir = dataset_it->second;
+    if (!parse_size(values, "window_size", &config->lzss.window_size, err) ||
+        !parse_size(values, "min_match_length",
+                    &config->lzss.min_match_length, err) ||
+        !parse_size(values, "max_match_length",
+                    &config->lzss.max_match_length, err) ||
+        !parse_size(values, "block_size", &config->block_size, err) ||
+        !parse_size(values, "max_workers", &config->max_workers, err) ||
+        !parse_parse_mode(values, &config->lzss.parse_mode, err) ||
+        !parse_hash_mode(values, &config->lzss.hash_mode, err)) {
+        return false;
+    }
+
+    const size_t hash_match_length =
+        config->lzss.hash_mode == LZSS_HASH3 ? 3 : 4;
+    if (config->lzss.window_size == 0 ||
+        config->lzss.min_match_length == 0 ||
+        config->lzss.max_match_length < config->lzss.min_match_length ||
+        config->block_size == 0 ||
+        config->max_workers == 0) {
+        err << "Invalid config: sizes must be positive and "
+            << "max_match_length must be >= min_match_length\n";
+        return false;
+    }
+    if (config->lzss.min_match_length < hash_match_length) {
+        err << "Invalid config: min_match_length must be >= "
+            << hash_match_length << " for "
+            << hash_mode_name(config->lzss.hash_mode) << '\n';
+        return false;
+    }
+
+    return true;
 }
 
 static std::vector<uint8_t> read_file(const std::filesystem::path& path)
@@ -68,6 +290,8 @@ static void copy_block_stats_to_result(
 static CompressionResult compress_decompress_file(
     const std::vector<uint8_t>& input,
     const LzssConfig& config,
+    size_t block_size,
+    size_t max_workers,
     std::ostream& err)
 {
     CompressionResult result{};
@@ -79,6 +303,8 @@ static CompressionResult compress_decompress_file(
     bool ok = lzss_tans_encode_blocks(
         input.empty() ? nullptr : input.data(),
         input.size(),
+        block_size,
+        max_workers,
         &config,
         &block_stream
     );
@@ -103,7 +329,12 @@ static CompressionResult compress_decompress_file(
     buffer_init_with_capacity(&decoded_bytes, input.size());
 
     const auto decompress_start = std::chrono::steady_clock::now();
-    ok = lzss_tans_decode_blocks(&block_stream, &config, &decoded_bytes);
+    ok = lzss_tans_decode_blocks(
+        &block_stream,
+        max_workers,
+        &config,
+        &decoded_bytes
+    );
     const auto decompress_end = std::chrono::steady_clock::now();
 
     result.decompress_ms =
@@ -130,13 +361,13 @@ static CompressionResult compress_decompress_file(
 
 bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
 {
-    const std::filesystem::path dataset_dir = "datasets";
-    const LzssConfig config{
-        1<<16,
-        4,
-        258,
-        LZSS_PARSE_LAZY
-    };
+    BenchmarkConfig benchmark_config{};
+    if (!load_benchmark_config("lzss.conf", &benchmark_config, err)) {
+        return false;
+    }
+
+    const std::filesystem::path& dataset_dir = benchmark_config.dataset_dir;
+    const LzssConfig& config = benchmark_config.lzss;
 
     if (!std::filesystem::exists(dataset_dir)) {
         err << "Dataset directory not found: " << dataset_dir.string() << '\n';
@@ -159,7 +390,14 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
 
     out << "Silesia benchmark\n";
     out << "Entropy codec = " << default_entropy_codec_name() << "\n";
-    out << "Block size = " << LZSS_TANS_BLOCK_SIZE << " bytes\n";
+    out << "Dataset directory = " << dataset_dir.string() << "\n";
+    out << "Window size = " << config.window_size << " bytes\n";
+    out << "Match length = " << config.min_match_length << ".."
+        << config.max_match_length << " bytes\n";
+    out << "Parse mode = " << parse_mode_name(config.parse_mode) << "\n";
+    out << "Hash mode = " << hash_mode_name(config.hash_mode) << "\n";
+    out << "Block size = " << benchmark_config.block_size << " bytes\n";
+    out << "Max workers = " << benchmark_config.max_workers << "\n";
     out << "Compression factor = original_size / compressed_size\n\n";
     out << std::left << std::setw(14) << "file"
         << std::right << std::setw(13) << "input"
@@ -195,7 +433,13 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
         }
 
         const CompressionResult result =
-            compress_decompress_file(input, config, err);
+            compress_decompress_file(
+                input,
+                config,
+                benchmark_config.block_size,
+                benchmark_config.max_workers,
+                err
+            );
 
         const double factor = result.compressed_size == 0
             ? 0.0
