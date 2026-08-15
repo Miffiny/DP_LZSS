@@ -15,6 +15,7 @@ CPPFLAGS := -I. -ILZSS
 LDFLAGS := -pthread
 
 CPP_SRCS := main.cpp lzss_test.cpp tans.cpp block_tans.cpp \
+	adaptive_ac.cpp block_ac.cpp \
 	LZSS/optimal_parser.cpp \
 	LZSS/decoder.cpp LZSS/mf.cpp LZSS/parser.cpp LZSS/token.cpp
 C_SRCS := ac.c bio.c
