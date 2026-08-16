@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <new>
+#include <unordered_map>
 #include <vector>
 
 static constexpr size_t REP_DISTANCE_COUNT = 3;
@@ -75,6 +77,10 @@ struct Order1ContextState {
     size_t literal_context;
     size_t length_context;
     size_t distance_context;
+};
+
+struct DistanceBitTreeModels {
+    std::unordered_map<uint32_t, struct model> models;
 };
 
 template <typename T, size_t N>
@@ -207,6 +213,38 @@ static size_t distance_symbol_count(uint32_t window_size)
                1,
                window_size
            );
+}
+
+static bool distance_uses_bit_tree(const LzssAdaptiveAcCodec *codec)
+{
+    return codec != nullptr &&
+           codec->config.distance_coding == LZSS_DISTANCE_BIT_TREE;
+}
+
+static size_t distance_mode_symbol_count(
+    const LzssConfig *config)
+{
+    if (config->distance_coding == LZSS_DISTANCE_BIT_TREE) {
+        return REP_DISTANCE_COUNT + 1;
+    }
+
+    return distance_symbol_count(static_cast<uint32_t>(config->window_size));
+}
+
+static size_t distance_bit_count_for_window(size_t window_size)
+{
+    if (window_size <= 1) {
+        return 0;
+    }
+
+    size_t bit_count = 0;
+    size_t max_value = window_size - 1;
+    while (max_value > 0) {
+        ++bit_count;
+        max_value >>= 1;
+    }
+
+    return bit_count;
 }
 
 static void repeat_distance_state_init(RepeatDistanceState *state)
@@ -453,6 +491,58 @@ static void destroy_context_models(struct model *models, size_t context_count)
     std::free(models);
 }
 
+static bool create_distance_bit_tree_models(LzssAdaptiveAcCodec *codec)
+{
+    if (codec == nullptr) {
+        return false;
+    }
+
+    codec->distance_bit_tree_models =
+        new (std::nothrow) DistanceBitTreeModels();
+    return codec->distance_bit_tree_models != nullptr;
+}
+
+static void destroy_distance_bit_tree_models(LzssAdaptiveAcCodec *codec)
+{
+    if (codec == nullptr || codec->distance_bit_tree_models == nullptr) {
+        return;
+    }
+
+    auto *tree = static_cast<DistanceBitTreeModels *>(
+        codec->distance_bit_tree_models
+    );
+
+    for (auto& entry : tree->models) {
+        if (entry.second.table != nullptr) {
+            model_destroy(&entry.second);
+        }
+    }
+
+    delete tree;
+    codec->distance_bit_tree_models = nullptr;
+}
+
+static struct model *distance_bit_tree_model_for_node(
+    LzssAdaptiveAcCodec *codec,
+    uint32_t node_index)
+{
+    if (codec == nullptr || codec->distance_bit_tree_models == nullptr) {
+        return nullptr;
+    }
+
+    auto *tree = static_cast<DistanceBitTreeModels *>(
+        codec->distance_bit_tree_models
+    );
+
+    auto result = tree->models.try_emplace(node_index);
+    struct model *model = &result.first->second;
+    if (result.second) {
+        model_create(model, 2);
+    }
+
+    return model;
+}
+
 static bool is_valid_config(const LzssConfig *config)
 {
     if (config == nullptr) {
@@ -471,6 +561,11 @@ static bool is_valid_config(const LzssConfig *config)
 
     if (config->max_match_length < config->min_match_length ||
         config->max_match_length > UINT32_MAX) {
+        return false;
+    }
+
+    if (config->distance_coding != LZSS_DISTANCE_CLASS &&
+        config->distance_coding != LZSS_DISTANCE_BIT_TREE) {
         return false;
     }
 
@@ -673,6 +768,85 @@ static bool decode_extra_bits_noise(
     return true;
 }
 
+static bool encode_distance_bit_tree(
+    LzssAdaptiveAcCodec *codec,
+    struct ac *ac,
+    struct bio *bio,
+    uint32_t distance)
+{
+    if (codec == nullptr ||
+        ac == nullptr ||
+        bio == nullptr ||
+        distance == 0 ||
+        distance > codec->config.window_size) {
+        return false;
+    }
+
+    const uint32_t value = distance - 1;
+    uint32_t node_index = 0;
+
+    for (size_t bit_index = 0;
+         bit_index < codec->distance_bit_count;
+         ++bit_index) {
+        struct model *bit_model =
+            distance_bit_tree_model_for_node(codec, node_index);
+        if (bit_model == nullptr) {
+            return false;
+        }
+
+        const size_t shift = codec->distance_bit_count - 1 - bit_index;
+        const size_t bit = (value >> shift) & 1u;
+        encode_symbol_adaptive(ac, bio, bit, bit_model);
+        node_index = node_index * 2 + 1 + static_cast<uint32_t>(bit);
+    }
+
+    return true;
+}
+
+static bool decode_distance_bit_tree(
+    LzssAdaptiveAcCodec *codec,
+    struct ac *ac,
+    struct bio *bio,
+    uint32_t *out_distance)
+{
+    if (codec == nullptr ||
+        ac == nullptr ||
+        bio == nullptr ||
+        out_distance == nullptr) {
+        return false;
+    }
+
+    uint32_t value = 0;
+    uint32_t node_index = 0;
+
+    for (size_t bit_index = 0;
+         bit_index < codec->distance_bit_count;
+         ++bit_index) {
+        struct model *bit_model =
+            distance_bit_tree_model_for_node(codec, node_index);
+        if (bit_model == nullptr) {
+            return false;
+        }
+
+        size_t bit = 0;
+        if (!decode_symbol_adaptive(ac, bio, bit_model, &bit) ||
+            bit > 1) {
+            return false;
+        }
+
+        value = (value << 1) | static_cast<uint32_t>(bit);
+        node_index = node_index * 2 + 1 + static_cast<uint32_t>(bit);
+    }
+
+    const uint32_t distance = value + 1;
+    if (distance == 0 || distance > codec->config.window_size) {
+        return false;
+    }
+
+    *out_distance = distance;
+    return true;
+}
+
 static bool encode_literal_length(
     LzssAdaptiveAcCodec *codec,
     struct ac *ac,
@@ -811,6 +985,38 @@ static bool encode_match(
         sequence->match_length - length_class->base
     );
 
+    if (distance_uses_bit_tree(codec)) {
+        size_t distance_symbol = REP_DISTANCE_COUNT;
+        const bool is_repeat_distance =
+            find_repeat_distance_symbol(
+                repeat_state,
+                sequence->match_distance,
+                &distance_symbol
+            );
+
+        if (!encode_symbol_order1(
+                ac,
+                bio,
+                distance_symbol,
+                codec->distance_models,
+                codec->distance_context_count,
+                &context_state->distance_context)) {
+            return false;
+        }
+
+        if (!is_repeat_distance &&
+            !encode_distance_bit_tree(
+                codec,
+                ac,
+                bio,
+                sequence->match_distance)) {
+            return false;
+        }
+
+        update_repeat_distances(repeat_state, sequence->match_distance);
+        return true;
+    }
+
     size_t distance_symbol = 0;
     const DeflateClass *distance_class = nullptr;
     if (!distance_symbol_for_value(
@@ -900,6 +1106,38 @@ static bool decode_match(
         return false;
     }
 
+    if (distance_uses_bit_tree(codec)) {
+        size_t distance_symbol = 0;
+        if (!decode_symbol_order1(
+                ac,
+                bio,
+                codec->distance_models,
+                codec->distance_context_count,
+                &context_state->distance_context,
+                &distance_symbol)) {
+            return false;
+        }
+
+        uint32_t distance = 0;
+        if (distance_symbol < REP_DISTANCE_COUNT) {
+            distance = repeat_state->distances[distance_symbol];
+            if (distance == 0 || distance > codec->config.window_size) {
+                return false;
+            }
+        } else if (distance_symbol == REP_DISTANCE_COUNT) {
+            if (!decode_distance_bit_tree(codec, ac, bio, &distance)) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+
+        sequence->match_length = length;
+        sequence->match_distance = distance;
+        update_repeat_distances(repeat_state, distance);
+        return true;
+    }
+
     size_t distance_symbol = 0;
     if (!decode_symbol_order1(
             ac,
@@ -974,13 +1212,17 @@ bool lzss_adaptive_ac_codec_init(
             static_cast<uint32_t>(config->max_match_length)
         );
 
-    const size_t distance_class_count =
-        distance_symbol_count(static_cast<uint32_t>(config->window_size));
+    const size_t distance_model_symbol_count =
+        distance_mode_symbol_count(config);
 
     codec->literal_length_context_count = literal_length_class_count + 1;
     codec->literal_context_count = 257;
     codec->length_context_count = length_class_count + 1;
-    codec->distance_context_count = distance_class_count + 1;
+    codec->distance_context_count = distance_model_symbol_count + 1;
+    codec->distance_bit_count =
+        config->distance_coding == LZSS_DISTANCE_BIT_TREE
+            ? distance_bit_count_for_window(config->window_size)
+            : 0;
 
     codec->literal_length_extra_bit_count =
         max_extra_bit_count(
@@ -999,12 +1241,14 @@ bool lzss_adaptive_ac_codec_init(
         );
 
     codec->distance_extra_bit_count =
-        max_extra_bit_count(
-            DISTANCE_CLASSES,
-            array_count(DISTANCE_CLASSES),
-            1,
-            static_cast<uint32_t>(config->window_size)
-        );
+        config->distance_coding == LZSS_DISTANCE_BIT_TREE
+            ? 0
+            : max_extra_bit_count(
+                  DISTANCE_CLASSES,
+                  array_count(DISTANCE_CLASSES),
+                  1,
+                  static_cast<uint32_t>(config->window_size)
+              );
 
     if (!create_context_models(
             &codec->literal_length_models,
@@ -1021,7 +1265,7 @@ bool lzss_adaptive_ac_codec_init(
         !create_context_models(
             &codec->distance_models,
             codec->distance_context_count,
-            distance_class_count) ||
+            distance_model_symbol_count) ||
         !create_bit_models(
             &codec->literal_length_extra_bit_models,
             codec->literal_length_extra_bit_count) ||
@@ -1031,6 +1275,12 @@ bool lzss_adaptive_ac_codec_init(
         !create_bit_models(
             &codec->distance_extra_bit_models,
             codec->distance_extra_bit_count)) {
+        lzss_adaptive_ac_codec_destroy(codec);
+        return false;
+    }
+
+    if (config->distance_coding == LZSS_DISTANCE_BIT_TREE &&
+        !create_distance_bit_tree_models(codec)) {
         lzss_adaptive_ac_codec_destroy(codec);
         return false;
     }
@@ -1061,6 +1311,7 @@ void lzss_adaptive_ac_codec_destroy(
         codec->distance_models,
         codec->distance_context_count
     );
+    destroy_distance_bit_tree_models(codec);
 
     destroy_bit_models(
         codec->literal_length_extra_bit_models,

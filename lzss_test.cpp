@@ -180,6 +180,45 @@ static const char *hash_mode_name(LzssHashMode hash_mode)
     return hash_mode == LZSS_HASH3 ? "hash3" : "hash4";
 }
 
+static bool parse_distance_coding(
+    const std::unordered_map<std::string, std::string>& values,
+    LzssDistanceCodingMode *out,
+    std::ostream& err)
+{
+    const auto it = values.find("distance_coding");
+    const std::string value =
+        it == values.end() || it->second.empty()
+            ? "class"
+            : to_lower(it->second);
+
+    if (value == "class" || value == "classes") {
+        *out = LZSS_DISTANCE_CLASS;
+        return true;
+    }
+    if (value == "bit_tree" ||
+        value == "bittree" ||
+        value == "tree") {
+        *out = LZSS_DISTANCE_BIT_TREE;
+        return true;
+    }
+
+    err << "Invalid distance_coding config value: " << it->second << '\n';
+    return false;
+}
+
+static const char *distance_coding_name(
+    LzssDistanceCodingMode distance_coding)
+{
+    switch (distance_coding) {
+    case LZSS_DISTANCE_CLASS:
+        return "class";
+    case LZSS_DISTANCE_BIT_TREE:
+        return "bit_tree";
+    }
+
+    return "unknown";
+}
+
 static bool parse_entropy_codec(
     const std::unordered_map<std::string, std::string>& values,
     EntropyCodec *out,
@@ -266,6 +305,7 @@ static bool load_benchmark_config(
         !parse_size(values, "max_workers", &config->max_workers, err) ||
         !parse_parse_mode(values, &config->lzss.parse_mode, err) ||
         !parse_hash_mode(values, &config->lzss.hash_mode, err) ||
+        !parse_distance_coding(values, &config->lzss.distance_coding, err) ||
         !parse_entropy_codec(values, &config->entropy_codec, err)) {
         return false;
     }
@@ -475,6 +515,8 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
         << config.max_match_length << " bytes\n";
     out << "Parse mode = " << parse_mode_name(config.parse_mode) << "\n";
     out << "Hash mode = " << hash_mode_name(config.hash_mode) << "\n";
+    out << "Distance coding = "
+        << distance_coding_name(config.distance_coding) << "\n";
     out << "Block size = " << benchmark_config.block_size << " bytes\n";
     out << "Max workers = " << benchmark_config.max_workers << "\n";
     out << "Compression factor = original_size / compressed_size\n\n";

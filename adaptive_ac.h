@@ -27,6 +27,9 @@ struct LzssAdaptiveAcCodec {
     struct model *literal_length_extra_bit_models;
     struct model *length_extra_bit_models;
     struct model *distance_extra_bit_models;
+
+    size_t distance_bit_count;
+    void *distance_bit_tree_models;
 };
 
 bool lzss_adaptive_ac_codec_init(

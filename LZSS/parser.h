@@ -16,12 +16,18 @@ typedef enum {
     LZSS_HASH4
 } LzssHashMode;
 
+typedef enum {
+    LZSS_DISTANCE_CLASS,
+    LZSS_DISTANCE_BIT_TREE
+} LzssDistanceCodingMode;
+
 typedef struct {
     size_t window_size;
     size_t min_match_length;
     size_t max_match_length;
     LzssParseMode parse_mode;
     LzssHashMode hash_mode;
+    LzssDistanceCodingMode distance_coding;
     //size_t max_candidates;
 } LzssConfig;
 
