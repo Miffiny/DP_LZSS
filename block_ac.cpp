@@ -150,7 +150,8 @@ static bool build_sequence_stream_for_block(
     const LzssConfig *config,
     LzssSequenceStream *sequence_stream)
 {
-    if (config->parse_mode != LZSS_PARSE_OPTIMAL) {
+    if (config->parse_mode != LZSS_PARSE_OPTIMAL &&
+        config->parse_mode != LZSS_PARSE_ADAPTIVE_OPTIMAL) {
         return lzss_encode(
             block_input,
             current_block_size,
@@ -165,26 +166,41 @@ static bool build_sequence_stream_for_block(
     LzssSequenceStream seed_stream;
     sequence_stream_init(&seed_stream, 0);
 
-    TansCodecGuardForCost cost_codec;
-    LzssTansCostModel cost_model;
+    bool ok = lzss_encode(
+        block_input,
+        current_block_size,
+        &seed_config,
+        &seed_stream
+    );
 
-    const bool ok =
-        lzss_encode(
-            block_input,
-            current_block_size,
-            &seed_config,
-            &seed_stream
-        ) &&
-        cost_codec.init(config) &&
-        lzss_tans_build_models(&cost_codec.codec, &seed_stream, true) &&
-        lzss_tans_cost_model_init(&cost_codec.codec, &cost_model) &&
-        lzss_encode_optimal(
-            block_input,
-            current_block_size,
-            config,
-            &cost_model,
-            sequence_stream
-        );
+    if (ok && config->parse_mode == LZSS_PARSE_ADAPTIVE_OPTIMAL) {
+        LzssAdaptiveAcCostModel cost_model;
+        ok = lzss_adaptive_ac_cost_model_init(
+                 config,
+                 &seed_stream,
+                 &cost_model
+             ) &&
+             lzss_encode_optimal_adaptive_ac(
+                 block_input,
+                 current_block_size,
+                 config,
+                 &cost_model,
+                 sequence_stream
+             );
+    } else if (ok) {
+        TansCodecGuardForCost cost_codec;
+        LzssTansCostModel cost_model;
+        ok = cost_codec.init(config) &&
+             lzss_tans_build_models(&cost_codec.codec, &seed_stream, true) &&
+             lzss_tans_cost_model_init(&cost_codec.codec, &cost_model) &&
+             lzss_encode_optimal(
+                 block_input,
+                 current_block_size,
+                 config,
+                 &cost_model,
+                 sequence_stream
+             );
+    }
 
     sequence_stream_free(&seed_stream);
     return ok;

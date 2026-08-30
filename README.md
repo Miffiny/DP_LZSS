@@ -24,5 +24,9 @@ distance bit tree.
 
 Use `parse_mode=optimal` to build tANS tables from the bounded lazy pass and
 then encode a second exhaustive optimal parse with those frozen cost tables.
+Use `parse_mode=adaptive_optimal` with `entropy_codec=ac` to build a frozen
+proxy cost model from the adaptive arithmetic coding contexts instead.
+
+Each benchmark run is also appended to `Optimal runs.txt`.
 
 Compile the project using `make` and run the `lzss` executable (`lzss.exe` for Windows).

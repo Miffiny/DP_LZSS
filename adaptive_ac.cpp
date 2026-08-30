@@ -3,11 +3,13 @@
 #include "ac.h"
 #include "bio.h"
 
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <new>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 static constexpr size_t REP_DISTANCE_COUNT = 3;
@@ -258,17 +260,28 @@ static void repeat_distance_state_init(RepeatDistanceState *state)
     }
 }
 
-static bool find_repeat_distance_symbol(
-    const RepeatDistanceState *state,
+static void repeat_distance_array_init(uint32_t *distances)
+{
+    if (distances == nullptr) {
+        return;
+    }
+
+    for (size_t i = 0; i < REP_DISTANCE_COUNT; ++i) {
+        distances[i] = 0;
+    }
+}
+
+static bool find_repeat_distance_symbol_array(
+    const uint32_t *distances,
     uint32_t distance,
     size_t *out_symbol)
 {
-    if (state == nullptr || out_symbol == nullptr || distance == 0) {
+    if (distances == nullptr || out_symbol == nullptr || distance == 0) {
         return false;
     }
 
     for (size_t i = 0; i < REP_DISTANCE_COUNT; ++i) {
-        if (state->distances[i] == distance) {
+        if (distances[i] == distance) {
             *out_symbol = i;
             return true;
         }
@@ -277,17 +290,33 @@ static bool find_repeat_distance_symbol(
     return false;
 }
 
-static void update_repeat_distances(
-    RepeatDistanceState *state,
+static bool find_repeat_distance_symbol(
+    const RepeatDistanceState *state,
+    uint32_t distance,
+    size_t *out_symbol)
+{
+    if (state == nullptr) {
+        return false;
+    }
+
+    return find_repeat_distance_symbol_array(
+        state->distances,
+        distance,
+        out_symbol
+    );
+}
+
+static void update_repeat_distance_array(
+    uint32_t *distances,
     uint32_t distance)
 {
-    if (state == nullptr || distance == 0) {
+    if (distances == nullptr || distance == 0) {
         return;
     }
 
     size_t existing_index = REP_DISTANCE_COUNT;
     for (size_t i = 0; i < REP_DISTANCE_COUNT; ++i) {
-        if (state->distances[i] == distance) {
+        if (distances[i] == distance) {
             existing_index = i;
             break;
         }
@@ -299,10 +328,21 @@ static void update_repeat_distances(
             : existing_index;
 
     for (size_t i = shift_count; i > 0; --i) {
-        state->distances[i] = state->distances[i - 1];
+        distances[i] = distances[i - 1];
     }
 
-    state->distances[0] = distance;
+    distances[0] = distance;
+}
+
+static void update_repeat_distances(
+    RepeatDistanceState *state,
+    uint32_t distance)
+{
+    if (state == nullptr) {
+        return;
+    }
+
+    update_repeat_distance_array(state->distances, distance);
 }
 
 static bool distance_symbol_for_value(
@@ -1182,6 +1222,871 @@ static bool decode_match(
     sequence->match_length = length;
     sequence->match_distance = distance;
     update_repeat_distances(repeat_state, distance);
+    return true;
+}
+
+static constexpr size_t ADAPTIVE_COST_MODEL_MAX_TOTAL = 1u << 20;
+
+static size_t distance_bit_tree_node_count(size_t bit_count)
+{
+    if (bit_count == 0) {
+        return 0;
+    }
+
+    if (bit_count >= std::numeric_limits<size_t>::digits) {
+        return 0;
+    }
+
+    return (static_cast<size_t>(1) << bit_count) - 1;
+}
+
+static bool flat_model_shape_is_valid(size_t context_count, size_t symbol_count)
+{
+    return context_count != 0 &&
+           symbol_count != 0 &&
+           context_count <=
+               std::numeric_limits<size_t>::max() / symbol_count;
+}
+
+static bool rescale_frequency_row(
+    std::vector<uint32_t> *frequencies,
+    std::vector<size_t> *totals,
+    size_t symbol_count,
+    size_t context)
+{
+    if (frequencies == nullptr ||
+        totals == nullptr ||
+        symbol_count == 0 ||
+        context >= totals->size()) {
+        return false;
+    }
+
+    const size_t base = context * symbol_count;
+    if (base > frequencies->size() ||
+        frequencies->size() - base < symbol_count) {
+        return false;
+    }
+
+    size_t total = 0;
+    for (size_t symbol = 0; symbol < symbol_count; ++symbol) {
+        uint32_t frequency = ((*frequencies)[base + symbol] + 1) / 2;
+        if (frequency == 0) {
+            frequency = 1;
+        }
+
+        (*frequencies)[base + symbol] = frequency;
+        if (total > std::numeric_limits<size_t>::max() - frequency) {
+            return false;
+        }
+        total += frequency;
+    }
+
+    (*totals)[context] = total;
+    return true;
+}
+
+static bool update_frequency(
+    std::vector<uint32_t> *frequencies,
+    std::vector<size_t> *totals,
+    size_t symbol_count,
+    size_t context,
+    size_t symbol)
+{
+    if (frequencies == nullptr ||
+        totals == nullptr ||
+        symbol_count == 0 ||
+        context >= totals->size() ||
+        symbol >= symbol_count) {
+        return false;
+    }
+
+    const size_t base = context * symbol_count;
+    if (base > frequencies->size() ||
+        frequencies->size() - base <= symbol) {
+        return false;
+    }
+
+    uint32_t& frequency = (*frequencies)[base + symbol];
+    if (frequency == UINT32_MAX) {
+        return false;
+    }
+
+    ++frequency;
+    if ((*totals)[context] == std::numeric_limits<size_t>::max()) {
+        return false;
+    }
+    ++(*totals)[context];
+
+    if ((*totals)[context] >= ADAPTIVE_COST_MODEL_MAX_TOTAL) {
+        return rescale_frequency_row(
+            frequencies,
+            totals,
+            symbol_count,
+            context
+        );
+    }
+
+    return true;
+}
+
+static bool costs_from_frequencies(
+    const std::vector<uint32_t>& frequencies,
+    const std::vector<size_t>& totals,
+    size_t symbol_count,
+    std::vector<double> *costs)
+{
+    if (costs == nullptr ||
+        symbol_count == 0 ||
+        totals.size() >
+            std::numeric_limits<size_t>::max() / symbol_count ||
+        frequencies.size() != totals.size() * symbol_count) {
+        return false;
+    }
+
+    std::vector<double> working(frequencies.size(), 0.0);
+    for (size_t context = 0; context < totals.size(); ++context) {
+        const size_t total = totals[context];
+        if (total == 0) {
+            return false;
+        }
+
+        const size_t base = context * symbol_count;
+        for (size_t symbol = 0; symbol < symbol_count; ++symbol) {
+            const uint32_t frequency = frequencies[base + symbol];
+            if (frequency == 0) {
+                return false;
+            }
+
+            working[base + symbol] = std::log2(
+                static_cast<double>(total) /
+                static_cast<double>(frequency)
+            );
+        }
+    }
+
+    *costs = std::move(working);
+    return true;
+}
+
+static bool lookup_symbol_cost(
+    const std::vector<double>& costs,
+    size_t context_count,
+    size_t symbol_count,
+    size_t context,
+    size_t symbol,
+    double *out_cost)
+{
+    if (out_cost == nullptr ||
+        !flat_model_shape_is_valid(context_count, symbol_count) ||
+        costs.size() != context_count * symbol_count ||
+        context >= context_count ||
+        symbol >= symbol_count) {
+        return false;
+    }
+
+    const double cost = costs[context * symbol_count + symbol];
+    if (!std::isfinite(cost)) {
+        return false;
+    }
+
+    *out_cost = cost;
+    return true;
+}
+
+static bool literal_length_symbol_for_value(
+    size_t literal_length,
+    size_t *out_symbol,
+    const DeflateClass **out_class)
+{
+    if (literal_length > UINT32_MAX) {
+        return false;
+    }
+
+    return find_class_for_value(
+        LITERAL_LENGTH_CLASSES,
+        array_count(LITERAL_LENGTH_CLASSES),
+        0,
+        UINT32_MAX,
+        static_cast<uint32_t>(literal_length),
+        out_symbol,
+        out_class
+    );
+}
+
+static bool literal_length_context_after(
+    const LzssAdaptiveAcCostModel *cost_model,
+    size_t literal_length_base_context,
+    size_t literal_length,
+    size_t *out_context)
+{
+    if (cost_model == nullptr ||
+        out_context == nullptr ||
+        literal_length_base_context >=
+            cost_model->literal_length_context_count) {
+        return false;
+    }
+
+    size_t symbol = 0;
+    const DeflateClass *literal_length_class = nullptr;
+    if (!literal_length_symbol_for_value(
+            literal_length,
+            &symbol,
+            &literal_length_class) ||
+        symbol >= cost_model->literal_length_symbol_count) {
+        return false;
+    }
+
+    (void)literal_length_class;
+    *out_context = symbol + 1;
+    return *out_context < cost_model->literal_length_context_count;
+}
+
+static bool length_cost_for_value(
+    const LzssAdaptiveAcCostModel *cost_model,
+    size_t context,
+    uint32_t length,
+    size_t *out_symbol,
+    double *out_cost)
+{
+    if (cost_model == nullptr ||
+        out_symbol == nullptr ||
+        out_cost == nullptr ||
+        context >= cost_model->length_context_count) {
+        return false;
+    }
+
+    size_t symbol = 0;
+    const DeflateClass *length_class = nullptr;
+    if (!find_class_for_value(
+            LENGTH_CLASSES,
+            array_count(LENGTH_CLASSES),
+            static_cast<uint32_t>(cost_model->config.min_match_length),
+            static_cast<uint32_t>(cost_model->config.max_match_length),
+            length,
+            &symbol,
+            &length_class) ||
+        symbol >= cost_model->length_symbol_count) {
+        return false;
+    }
+
+    double symbol_cost = 0.0;
+    if (!lookup_symbol_cost(
+            cost_model->length_symbol_costs,
+            cost_model->length_context_count,
+            cost_model->length_symbol_count,
+            context,
+            symbol,
+            &symbol_cost)) {
+        return false;
+    }
+
+    *out_symbol = symbol;
+    *out_cost = symbol_cost + static_cast<double>(length_class->extra_bits);
+    return std::isfinite(*out_cost);
+}
+
+static bool distance_symbol_for_cost_state(
+    const LzssAdaptiveAcCostModel *cost_model,
+    const uint32_t *repeat_distances,
+    uint32_t distance,
+    size_t *out_symbol,
+    const DeflateClass **out_class)
+{
+    if (cost_model == nullptr ||
+        repeat_distances == nullptr ||
+        out_symbol == nullptr ||
+        out_class == nullptr ||
+        distance == 0 ||
+        distance > cost_model->config.window_size) {
+        return false;
+    }
+
+    size_t repeat_symbol = 0;
+    if (find_repeat_distance_symbol_array(
+            repeat_distances,
+            distance,
+            &repeat_symbol)) {
+        *out_symbol = repeat_symbol;
+        *out_class = nullptr;
+        return true;
+    }
+
+    if (cost_model->config.distance_coding == LZSS_DISTANCE_BIT_TREE) {
+        *out_symbol = REP_DISTANCE_COUNT;
+        *out_class = nullptr;
+        return true;
+    }
+
+    size_t distance_class_symbol = 0;
+    const DeflateClass *distance_class = nullptr;
+    if (!find_class_for_value(
+            DISTANCE_CLASSES,
+            array_count(DISTANCE_CLASSES),
+            1,
+            static_cast<uint32_t>(cost_model->config.window_size),
+            distance,
+            &distance_class_symbol,
+            &distance_class)) {
+        return false;
+    }
+
+    *out_symbol = REP_DISTANCE_COUNT + distance_class_symbol;
+    *out_class = distance_class;
+    return true;
+}
+
+static bool update_distance_bit_tree_frequencies(
+    const LzssAdaptiveAcCostModel *cost_model,
+    uint32_t distance,
+    std::vector<uint32_t> *frequencies,
+    std::vector<size_t> *totals)
+{
+    if (cost_model == nullptr ||
+        frequencies == nullptr ||
+        totals == nullptr ||
+        distance == 0 ||
+        distance > cost_model->config.window_size) {
+        return false;
+    }
+
+    const uint32_t value = distance - 1;
+    size_t node_index = 0;
+
+    for (size_t bit_index = 0;
+         bit_index < cost_model->distance_bit_count;
+         ++bit_index) {
+        const size_t shift = cost_model->distance_bit_count - 1 - bit_index;
+        const size_t bit = (value >> shift) & 1u;
+
+        if (!update_frequency(frequencies, totals, 2, node_index, bit)) {
+            return false;
+        }
+
+        node_index = node_index * 2 + 1 + bit;
+    }
+
+    return true;
+}
+
+static bool distance_bit_tree_cost(
+    const LzssAdaptiveAcCostModel *cost_model,
+    uint32_t distance,
+    double *out_cost)
+{
+    if (cost_model == nullptr ||
+        out_cost == nullptr ||
+        distance == 0 ||
+        distance > cost_model->config.window_size) {
+        return false;
+    }
+
+    const uint32_t value = distance - 1;
+    size_t node_index = 0;
+    double total_cost = 0.0;
+
+    for (size_t bit_index = 0;
+         bit_index < cost_model->distance_bit_count;
+         ++bit_index) {
+        const size_t shift = cost_model->distance_bit_count - 1 - bit_index;
+        const size_t bit = (value >> shift) & 1u;
+        double bit_cost = 0.0;
+
+        if (!lookup_symbol_cost(
+                cost_model->distance_bit_costs,
+                distance_bit_tree_node_count(cost_model->distance_bit_count),
+                2,
+                node_index,
+                bit,
+                &bit_cost)) {
+            return false;
+        }
+
+        total_cost += bit_cost;
+        node_index = node_index * 2 + 1 + bit;
+    }
+
+    *out_cost = total_cost;
+    return std::isfinite(*out_cost);
+}
+
+static bool distance_cost_for_value(
+    const LzssAdaptiveAcCostModel *cost_model,
+    const uint32_t *repeat_distances,
+    size_t context,
+    uint32_t distance,
+    size_t *out_symbol,
+    double *out_cost)
+{
+    if (cost_model == nullptr ||
+        repeat_distances == nullptr ||
+        out_symbol == nullptr ||
+        out_cost == nullptr ||
+        context >= cost_model->distance_context_count) {
+        return false;
+    }
+
+    size_t symbol = 0;
+    const DeflateClass *distance_class = nullptr;
+    if (!distance_symbol_for_cost_state(
+            cost_model,
+            repeat_distances,
+            distance,
+            &symbol,
+            &distance_class) ||
+        symbol >= cost_model->distance_symbol_count) {
+        return false;
+    }
+
+    double symbol_cost = 0.0;
+    if (!lookup_symbol_cost(
+            cost_model->distance_symbol_costs,
+            cost_model->distance_context_count,
+            cost_model->distance_symbol_count,
+            context,
+            symbol,
+            &symbol_cost)) {
+        return false;
+    }
+
+    double extra_cost = 0.0;
+    if (distance_class != nullptr) {
+        extra_cost = static_cast<double>(distance_class->extra_bits);
+    } else if (cost_model->config.distance_coding == LZSS_DISTANCE_BIT_TREE &&
+               symbol == REP_DISTANCE_COUNT &&
+               !distance_bit_tree_cost(cost_model, distance, &extra_cost)) {
+        return false;
+    }
+
+    *out_symbol = symbol;
+    *out_cost = symbol_cost + extra_cost;
+    return std::isfinite(*out_cost);
+}
+
+void lzss_adaptive_ac_cost_state_init(
+    LzssAdaptiveAcCostState *state)
+{
+    if (state == nullptr) {
+        return;
+    }
+
+    repeat_distance_array_init(state->repeat_distances);
+    state->literal_length_base_context = 0;
+    state->literal_context = 0;
+    state->length_context = 0;
+    state->distance_context = 0;
+}
+
+bool lzss_adaptive_ac_literal_length_cost(
+    const LzssAdaptiveAcCostModel *cost_model,
+    size_t literal_length_base_context,
+    size_t literal_length,
+    double *out_cost)
+{
+    if (cost_model == nullptr ||
+        out_cost == nullptr ||
+        literal_length_base_context >=
+            cost_model->literal_length_context_count) {
+        return false;
+    }
+
+    size_t symbol = 0;
+    const DeflateClass *literal_length_class = nullptr;
+    if (!literal_length_symbol_for_value(
+            literal_length,
+            &symbol,
+            &literal_length_class) ||
+        symbol >= cost_model->literal_length_symbol_count) {
+        return false;
+    }
+
+    double symbol_cost = 0.0;
+    if (!lookup_symbol_cost(
+            cost_model->literal_length_symbol_costs,
+            cost_model->literal_length_context_count,
+            cost_model->literal_length_symbol_count,
+            literal_length_base_context,
+            symbol,
+            &symbol_cost)) {
+        return false;
+    }
+
+    *out_cost =
+        symbol_cost + static_cast<double>(literal_length_class->extra_bits);
+    return std::isfinite(*out_cost);
+}
+
+bool lzss_adaptive_ac_literal_transition_cost(
+    const LzssAdaptiveAcCostModel *cost_model,
+    const LzssAdaptiveAcCostState *state,
+    size_t literal_run_length,
+    uint8_t literal,
+    double *out_delta_cost,
+    LzssAdaptiveAcCostState *out_state)
+{
+    if (cost_model == nullptr ||
+        state == nullptr ||
+        out_delta_cost == nullptr ||
+        out_state == nullptr ||
+        state->literal_context >= cost_model->literal_context_count ||
+        literal_run_length == std::numeric_limits<size_t>::max()) {
+        return false;
+    }
+
+    double old_length_cost = 0.0;
+    double new_length_cost = 0.0;
+    double literal_cost = 0.0;
+
+    if (!lzss_adaptive_ac_literal_length_cost(
+            cost_model,
+            state->literal_length_base_context,
+            literal_run_length,
+            &old_length_cost) ||
+        !lzss_adaptive_ac_literal_length_cost(
+            cost_model,
+            state->literal_length_base_context,
+            literal_run_length + 1,
+            &new_length_cost) ||
+        !lookup_symbol_cost(
+            cost_model->literal_costs,
+            cost_model->literal_context_count,
+            256,
+            state->literal_context,
+            literal,
+            &literal_cost)) {
+        return false;
+    }
+
+    *out_state = *state;
+    out_state->literal_context = static_cast<size_t>(literal) + 1;
+    *out_delta_cost = literal_cost + new_length_cost - old_length_cost;
+    return std::isfinite(*out_delta_cost);
+}
+
+bool lzss_adaptive_ac_match_transition_cost(
+    const LzssAdaptiveAcCostModel *cost_model,
+    const LzssAdaptiveAcCostState *state,
+    size_t literal_run_length,
+    uint32_t match_length,
+    uint32_t match_distance,
+    double *out_delta_cost,
+    LzssAdaptiveAcCostState *out_state)
+{
+    if (cost_model == nullptr ||
+        state == nullptr ||
+        out_delta_cost == nullptr ||
+        out_state == nullptr ||
+        match_length < cost_model->config.min_match_length ||
+        match_length > cost_model->config.max_match_length ||
+        match_distance == 0 ||
+        match_distance > cost_model->config.window_size) {
+        return false;
+    }
+
+    size_t next_literal_length_base_context = 0;
+    if (!literal_length_context_after(
+            cost_model,
+            state->literal_length_base_context,
+            literal_run_length,
+            &next_literal_length_base_context)) {
+        return false;
+    }
+
+    size_t length_symbol = 0;
+    double length_cost = 0.0;
+    if (!length_cost_for_value(
+            cost_model,
+            state->length_context,
+            match_length,
+            &length_symbol,
+            &length_cost)) {
+        return false;
+    }
+
+    size_t distance_symbol = 0;
+    double distance_cost = 0.0;
+    if (!distance_cost_for_value(
+            cost_model,
+            state->repeat_distances,
+            state->distance_context,
+            match_distance,
+            &distance_symbol,
+            &distance_cost)) {
+        return false;
+    }
+
+    double empty_literal_length_cost = 0.0;
+    if (!lzss_adaptive_ac_literal_length_cost(
+            cost_model,
+            next_literal_length_base_context,
+            0,
+            &empty_literal_length_cost)) {
+        return false;
+    }
+
+    *out_state = *state;
+    out_state->literal_length_base_context =
+        next_literal_length_base_context;
+    out_state->length_context = length_symbol + 1;
+    out_state->distance_context = distance_symbol + 1;
+    update_repeat_distance_array(
+        out_state->repeat_distances,
+        match_distance
+    );
+
+    *out_delta_cost =
+        length_cost + distance_cost + empty_literal_length_cost;
+    return std::isfinite(*out_delta_cost);
+}
+
+bool lzss_adaptive_ac_cost_model_init(
+    const LzssConfig *config,
+    const LzssSequenceStream *seed_stream,
+    LzssAdaptiveAcCostModel *cost_model)
+{
+    if (cost_model == nullptr ||
+        seed_stream == nullptr ||
+        !is_valid_config(config)) {
+        return false;
+    }
+
+    LzssAdaptiveAcCodec layout_codec{};
+    layout_codec.config = *config;
+    if (!sequence_layout_is_valid(&layout_codec, seed_stream)) {
+        return false;
+    }
+
+    const size_t literal_length_symbol_count =
+        active_class_count(
+            LITERAL_LENGTH_CLASSES,
+            array_count(LITERAL_LENGTH_CLASSES),
+            0,
+            UINT32_MAX
+        );
+    const size_t length_symbol_count =
+        active_class_count(
+            LENGTH_CLASSES,
+            array_count(LENGTH_CLASSES),
+            static_cast<uint32_t>(config->min_match_length),
+            static_cast<uint32_t>(config->max_match_length)
+        );
+    const size_t distance_symbol_model_count =
+        distance_mode_symbol_count(config);
+
+    const size_t literal_length_context_count =
+        literal_length_symbol_count + 1;
+    const size_t literal_context_count = 257;
+    const size_t length_context_count = length_symbol_count + 1;
+    const size_t distance_context_count = distance_symbol_model_count + 1;
+    const size_t distance_bit_count =
+        config->distance_coding == LZSS_DISTANCE_BIT_TREE
+            ? distance_bit_count_for_window(config->window_size)
+            : 0;
+
+    if (!flat_model_shape_is_valid(
+            literal_length_context_count,
+            literal_length_symbol_count) ||
+        !flat_model_shape_is_valid(literal_context_count, 256) ||
+        !flat_model_shape_is_valid(
+            length_context_count,
+            length_symbol_count) ||
+        !flat_model_shape_is_valid(
+            distance_context_count,
+            distance_symbol_model_count)) {
+        return false;
+    }
+
+    std::vector<uint32_t> literal_length_frequencies(
+        literal_length_context_count * literal_length_symbol_count,
+        1
+    );
+    std::vector<uint32_t> literal_frequencies(
+        literal_context_count * 256,
+        1
+    );
+    std::vector<uint32_t> length_frequencies(
+        length_context_count * length_symbol_count,
+        1
+    );
+    std::vector<uint32_t> distance_symbol_frequencies(
+        distance_context_count * distance_symbol_model_count,
+        1
+    );
+
+    std::vector<size_t> literal_length_totals(
+        literal_length_context_count,
+        literal_length_symbol_count
+    );
+    std::vector<size_t> literal_totals(literal_context_count, 256);
+    std::vector<size_t> length_totals(
+        length_context_count,
+        length_symbol_count
+    );
+    std::vector<size_t> distance_symbol_totals(
+        distance_context_count,
+        distance_symbol_model_count
+    );
+
+    const size_t distance_node_count =
+        distance_bit_tree_node_count(distance_bit_count);
+    std::vector<uint32_t> distance_bit_frequencies(
+        distance_node_count * 2,
+        1
+    );
+    std::vector<size_t> distance_bit_totals(distance_node_count, 2);
+
+    size_t literal_length_context = 0;
+    size_t literal_context = 0;
+    size_t length_context = 0;
+    size_t distance_context = 0;
+    uint32_t repeat_distances[REP_DISTANCE_COUNT];
+    repeat_distance_array_init(repeat_distances);
+
+    for (size_t i = 0; i < seed_stream->sequences.size(); ++i) {
+        const LzssSequence& sequence = seed_stream->sequences[i];
+
+        if (i > 0) {
+            size_t length_symbol = 0;
+            const DeflateClass *length_class = nullptr;
+            if (!find_class_for_value(
+                    LENGTH_CLASSES,
+                    array_count(LENGTH_CLASSES),
+                    static_cast<uint32_t>(config->min_match_length),
+                    static_cast<uint32_t>(config->max_match_length),
+                    sequence.match_length,
+                    &length_symbol,
+                    &length_class) ||
+                !update_frequency(
+                    &length_frequencies,
+                    &length_totals,
+                    length_symbol_count,
+                    length_context,
+                    length_symbol)) {
+                return false;
+            }
+
+            (void)length_class;
+            length_context = length_symbol + 1;
+
+            LzssAdaptiveAcCostModel partial_model{};
+            partial_model.config = *config;
+            partial_model.distance_symbol_count =
+                distance_symbol_model_count;
+            partial_model.distance_bit_count = distance_bit_count;
+
+            size_t distance_symbol = 0;
+            const DeflateClass *distance_class = nullptr;
+            if (!distance_symbol_for_cost_state(
+                    &partial_model,
+                    repeat_distances,
+                    sequence.match_distance,
+                    &distance_symbol,
+                    &distance_class) ||
+                !update_frequency(
+                    &distance_symbol_frequencies,
+                    &distance_symbol_totals,
+                    distance_symbol_model_count,
+                    distance_context,
+                    distance_symbol)) {
+                return false;
+            }
+
+            if (config->distance_coding == LZSS_DISTANCE_BIT_TREE &&
+                distance_symbol == REP_DISTANCE_COUNT &&
+                !update_distance_bit_tree_frequencies(
+                    &partial_model,
+                    sequence.match_distance,
+                    &distance_bit_frequencies,
+                    &distance_bit_totals)) {
+                return false;
+            }
+
+            (void)distance_class;
+            distance_context = distance_symbol + 1;
+            update_repeat_distance_array(
+                repeat_distances,
+                sequence.match_distance
+            );
+        }
+
+        size_t literal_length_symbol = 0;
+        const DeflateClass *literal_length_class = nullptr;
+        if (!literal_length_symbol_for_value(
+                sequence.lit_length,
+                &literal_length_symbol,
+                &literal_length_class) ||
+            !update_frequency(
+                &literal_length_frequencies,
+                &literal_length_totals,
+                literal_length_symbol_count,
+                literal_length_context,
+                literal_length_symbol)) {
+            return false;
+        }
+
+        (void)literal_length_class;
+        literal_length_context = literal_length_symbol + 1;
+
+        for (uint32_t literal_index = 0;
+             literal_index < sequence.lit_length;
+             ++literal_index) {
+            const uint8_t literal = sequence.literals_ptr[literal_index];
+            if (!update_frequency(
+                    &literal_frequencies,
+                    &literal_totals,
+                    256,
+                    literal_context,
+                    literal)) {
+                return false;
+            }
+
+            literal_context = static_cast<size_t>(literal) + 1;
+        }
+    }
+
+    LzssAdaptiveAcCostModel working{};
+    working.config = *config;
+    working.literal_length_symbol_count = literal_length_symbol_count;
+    working.length_symbol_count = length_symbol_count;
+    working.distance_symbol_count = distance_symbol_model_count;
+    working.literal_length_context_count = literal_length_context_count;
+    working.literal_context_count = literal_context_count;
+    working.length_context_count = length_context_count;
+    working.distance_context_count = distance_context_count;
+    working.distance_bit_count = distance_bit_count;
+
+    if (!costs_from_frequencies(
+            literal_length_frequencies,
+            literal_length_totals,
+            literal_length_symbol_count,
+            &working.literal_length_symbol_costs) ||
+        !costs_from_frequencies(
+            literal_frequencies,
+            literal_totals,
+            256,
+            &working.literal_costs) ||
+        !costs_from_frequencies(
+            length_frequencies,
+            length_totals,
+            length_symbol_count,
+            &working.length_symbol_costs) ||
+        !costs_from_frequencies(
+            distance_symbol_frequencies,
+            distance_symbol_totals,
+            distance_symbol_model_count,
+            &working.distance_symbol_costs)) {
+        return false;
+    }
+
+    if (distance_node_count > 0 &&
+        !costs_from_frequencies(
+            distance_bit_frequencies,
+            distance_bit_totals,
+            2,
+            &working.distance_bit_costs)) {
+        return false;
+    }
+
+    *cost_model = std::move(working);
     return true;
 }
 

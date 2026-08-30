@@ -66,7 +66,8 @@ bool lzss_encode(const uint8_t* input, size_t input_size,
     if ((input_size > 0 && !input) ||
         !config ||
         !out_stream ||
-        config->parse_mode == LZSS_PARSE_OPTIMAL) {
+        config->parse_mode == LZSS_PARSE_OPTIMAL ||
+        config->parse_mode == LZSS_PARSE_ADAPTIVE_OPTIMAL) {
         return false;
     }
 
@@ -137,4 +138,3 @@ bool lzss_encode(const uint8_t* input, size_t input_size,
     match_finder_destroy(mf);
     return true;
 }
-

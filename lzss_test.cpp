@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <limits>
 #include <ostream>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -131,6 +132,13 @@ static bool parse_parse_mode(
         *out = LZSS_PARSE_OPTIMAL;
         return true;
     }
+    if (value == "adaptive_optimal" ||
+        value == "adaptive-optimal" ||
+        value == "ac_optimal" ||
+        value == "ac-optimal") {
+        *out = LZSS_PARSE_ADAPTIVE_OPTIMAL;
+        return true;
+    }
 
     err << "Invalid parse_mode config value: " << it->second << '\n';
     return false;
@@ -145,6 +153,8 @@ static const char *parse_mode_name(LzssParseMode parse_mode)
         return "lazy";
     case LZSS_PARSE_OPTIMAL:
         return "optimal";
+    case LZSS_PARSE_ADAPTIVE_OPTIMAL:
+        return "adaptive_optimal";
     }
 
     return "unknown";
@@ -327,6 +337,12 @@ static bool load_benchmark_config(
             << hash_mode_name(config->lzss.hash_mode) << '\n';
         return false;
     }
+    if (config->entropy_codec != ENTROPY_CODEC_ADAPTIVE_AC &&
+        config->lzss.parse_mode == LZSS_PARSE_ADAPTIVE_OPTIMAL) {
+        err << "Invalid config: adaptive_optimal parse_mode requires "
+            << "entropy_codec=ac\n";
+        return false;
+    }
 
     return true;
 }
@@ -506,21 +522,29 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
         return false;
     }
 
-    out << "Silesia benchmark\n";
-    out << "Entropy codec = "
+    std::ostringstream report;
+    auto emit_report = [&](const std::string& text) {
+        report << text;
+        out << text;
+        out.flush();
+    };
+
+    std::ostringstream header;
+    header << "Silesia benchmark\n";
+    header << "Entropy codec = "
         << entropy_codec_name(benchmark_config.entropy_codec) << "\n";
-    out << "Dataset directory = " << dataset_dir.string() << "\n";
-    out << "Window size = " << config.window_size << " bytes\n";
-    out << "Match length = " << config.min_match_length << ".."
+    header << "Dataset directory = " << dataset_dir.string() << "\n";
+    header << "Window size = " << config.window_size << " bytes\n";
+    header << "Match length = " << config.min_match_length << ".."
         << config.max_match_length << " bytes\n";
-    out << "Parse mode = " << parse_mode_name(config.parse_mode) << "\n";
-    out << "Hash mode = " << hash_mode_name(config.hash_mode) << "\n";
-    out << "Distance coding = "
+    header << "Parse mode = " << parse_mode_name(config.parse_mode) << "\n";
+    header << "Hash mode = " << hash_mode_name(config.hash_mode) << "\n";
+    header << "Distance coding = "
         << distance_coding_name(config.distance_coding) << "\n";
-    out << "Block size = " << benchmark_config.block_size << " bytes\n";
-    out << "Max workers = " << benchmark_config.max_workers << "\n";
-    out << "Compression factor = original_size / compressed_size\n\n";
-    out << std::left << std::setw(14) << "file"
+    header << "Block size = " << benchmark_config.block_size << " bytes\n";
+    header << "Max workers = " << benchmark_config.max_workers << "\n";
+    header << "Compression factor = original_size / compressed_size\n\n";
+    header << std::left << std::setw(14) << "file"
         << std::right << std::setw(13) << "input"
         << std::setw(13) << "compressed"
         << std::setw(11) << "factor"
@@ -532,6 +556,7 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
         << std::setw(13) << "match mem"
         << std::setw(12) << "avg match"
         << '\n';
+    emit_report(header.str());
 
     bool all_ok = true;
     size_t total_input = 0;
@@ -572,7 +597,8 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
             : static_cast<double>(result.match_length_total) /
               static_cast<double>(result.match_token_count);
 
-        out << std::left << std::setw(14) << path.filename().string()
+        std::ostringstream row;
+        row << std::left << std::setw(14) << path.filename().string()
             << std::right << std::setw(13) << input.size()
             << std::setw(13) << result.compressed_size
             << std::setw(11) << std::fixed << std::setprecision(3) << factor
@@ -588,6 +614,7 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
             << avg_match_length
             << (result.ok ? "" : "  FAIL")
             << '\n';
+        emit_report(row.str());
 
         all_ok = result.ok && all_ok;
         total_input += input.size();
@@ -610,7 +637,8 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
         : static_cast<double>(total_match_length) /
           static_cast<double>(total_match_tokens);
 
-    out << '\n'
+    std::ostringstream summary;
+    summary << '\n'
         << std::left << std::setw(14) << "TOTAL"
         << std::right << std::setw(13) << total_input
         << std::setw(13) << total_compressed
@@ -628,7 +656,18 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
         << total_avg_match_length
         << '\n';
 
-    out << (all_ok ? "OK, all checks passed\n"
-                  : "FAIL, some checks failed\n");
+    summary << (all_ok ? "OK, all checks passed\n"
+                       : "FAIL, some checks failed\n");
+    emit_report(summary.str());
+
+    const std::string report_text = report.str();
+
+    std::ofstream history("Optimal runs.txt", std::ios::app);
+    if (history) {
+        history << "\n\n" << report_text;
+    } else {
+        err << "Failed to append benchmark result to Optimal runs.txt\n";
+    }
+
     return all_ok;
 }

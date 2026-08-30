@@ -7,7 +7,8 @@
 typedef enum {
     LZSS_PARSE_GREEDY,
     LZSS_PARSE_LAZY,
-    LZSS_PARSE_OPTIMAL
+    LZSS_PARSE_OPTIMAL,
+    LZSS_PARSE_ADAPTIVE_OPTIMAL
     // Future parser work can add a cost-aware mode here.
 } LzssParseMode;
 
