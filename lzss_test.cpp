@@ -32,6 +32,8 @@ struct BenchmarkConfig {
 
 struct CompressionResult {
     bool ok;
+    bool stats_consistent;
+    size_t block_count;
     size_t token_count;
     size_t match_token_count;
     size_t literal_token_count;
@@ -41,6 +43,114 @@ struct CompressionResult {
     double compress_ms;
     double decompress_ms;
 };
+
+struct DerivedCompressionStats {
+    double bits_per_byte;
+    double compression_factor;
+    double saving_percent;
+    double compression_mib_per_second;
+    double decompression_mib_per_second;
+    double match_coverage_percent;
+    double literal_coverage_percent;
+    double average_match_length;
+    double average_literals_per_sequence;
+    double matches_per_kib;
+};
+
+static double throughput_mib_per_second(size_t input_size, double elapsed_ms)
+{
+    if (input_size == 0 || elapsed_ms <= 0.0) {
+        return 0.0;
+    }
+
+    const double input_mib =
+        static_cast<double>(input_size) / (1024.0 * 1024.0);
+    const double elapsed_seconds = elapsed_ms / 1000.0;
+    return input_mib / elapsed_seconds;
+}
+
+static DerivedCompressionStats calculate_derived_stats(
+    size_t input_size,
+    const CompressionResult& result)
+{
+    DerivedCompressionStats stats{};
+
+    if (input_size > 0) {
+        stats.bits_per_byte =
+            8.0 * static_cast<double>(result.compressed_size) /
+            static_cast<double>(input_size);
+        stats.saving_percent =
+            100.0 *
+            (1.0 -
+             static_cast<double>(result.compressed_size) /
+             static_cast<double>(input_size));
+        stats.match_coverage_percent =
+            100.0 * static_cast<double>(result.match_length_total) /
+            static_cast<double>(input_size);
+        stats.literal_coverage_percent =
+            100.0 * static_cast<double>(result.literal_token_count) /
+            static_cast<double>(input_size);
+        stats.matches_per_kib =
+            1024.0 * static_cast<double>(result.match_token_count) /
+            static_cast<double>(input_size);
+    }
+
+    if (result.compressed_size > 0) {
+        stats.compression_factor =
+            static_cast<double>(input_size) /
+            static_cast<double>(result.compressed_size);
+    }
+
+    if (result.match_token_count > 0) {
+        stats.average_match_length =
+            static_cast<double>(result.match_length_total) /
+            static_cast<double>(result.match_token_count);
+    }
+
+    if (result.token_count > 0) {
+        stats.average_literals_per_sequence =
+            static_cast<double>(result.literal_token_count) /
+            static_cast<double>(result.token_count);
+    }
+
+    stats.compression_mib_per_second =
+        throughput_mib_per_second(input_size, result.compress_ms);
+    stats.decompression_mib_per_second =
+        throughput_mib_per_second(input_size, result.decompress_ms);
+
+    return stats;
+}
+
+static bool represented_size_is_consistent(
+    size_t input_size,
+    size_t literal_byte_count,
+    size_t matched_byte_count,
+    size_t *represented_size)
+{
+    if (literal_byte_count >
+        std::numeric_limits<size_t>::max() - matched_byte_count) {
+        return false;
+    }
+
+    const size_t represented = literal_byte_count + matched_byte_count;
+    if (represented_size != nullptr) {
+        *represented_size = represented;
+    }
+
+    return represented == input_size;
+}
+
+static bool sequence_statistics_are_consistent(
+    size_t input_size,
+    const CompressionResult& result)
+{
+    return represented_size_is_consistent(
+        input_size,
+        result.literal_token_count,
+        result.match_length_total,
+        nullptr
+    );
+}
 
 static const char *entropy_codec_name(EntropyCodec entropy_codec)
 {
@@ -393,6 +503,9 @@ static CompressionResult compress_decompress_file(
     std::ostream& err)
 {
     CompressionResult result{};
+    result.block_count = input.empty()
+        ? 1
+        : (input.size() - 1) / block_size + 1;
 
     const auto compress_start = std::chrono::steady_clock::now();
 
@@ -474,6 +587,9 @@ static CompressionResult compress_decompress_file(
     const bool same_data = same_size &&
         std::equal(input.begin(), input.end(), decoded_bytes.data);
 
+    result.stats_consistent =
+        sequence_statistics_are_consistent(input.size(), result);
+
     if (!(ok && same_data)) {
         const size_t block_count =
             entropy_codec == ENTROPY_CODEC_ADAPTIVE_AC
@@ -485,7 +601,26 @@ static CompressionResult compress_decompress_file(
             << " blocks=" << block_count << '\n';
     }
 
-    result.ok = ok && same_data;
+    if (ok && same_data && !result.stats_consistent) {
+        err << "  inconsistent LZSS statistics:"
+            << " input=" << input.size()
+            << " literals=" << result.literal_token_count
+            << " matched=" << result.match_length_total;
+
+        if (result.literal_token_count <=
+            std::numeric_limits<size_t>::max() -
+                result.match_length_total) {
+            const size_t represented_size =
+                result.literal_token_count + result.match_length_total;
+            err << " represented=" << represented_size;
+        } else {
+            err << " represented=overflow";
+        }
+
+        err << '\n';
+    }
+
+    result.ok = ok && same_data && result.stats_consistent;
 
     buffer_free(&decoded_bytes);
     lzss_tans_block_stream_clear(&tans_block_stream);
@@ -543,28 +678,34 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
         << distance_coding_name(config.distance_coding) << "\n";
     header << "Block size = " << benchmark_config.block_size << " bytes\n";
     header << "Max workers = " << benchmark_config.max_workers << "\n";
-    header << "Compression factor = original_size / compressed_size\n\n";
+    header << "Compression factor = input bytes / payload bytes\n";
+    header << "Payload size is rounded to complete 32-bit words and does "
+              "not include an outer container header\n\n";
     header << std::left << std::setw(14) << "file"
-        << std::right << std::setw(13) << "input"
-        << std::setw(13) << "compressed"
-        << std::setw(11) << "factor"
-        << std::setw(14) << "comp ms"
-        << std::setw(14) << "decomp ms"
-        << std::setw(12) << "tokens"
+        << std::right << std::setw(12) << "input"
+        << std::setw(12) << "payload"
+        << std::setw(9) << "bit/B"
+        << std::setw(9) << "factor"
+        << std::setw(9) << "save %"
+        << std::setw(12) << "C MiB/s"
+        << std::setw(12) << "D MiB/s"
+        << std::setw(9) << "blocks"
+        << std::setw(12) << "sequences"
         << std::setw(12) << "matches"
-        << std::setw(12) << "literals"
-        << std::setw(13) << "match mem"
-        << std::setw(12) << "avg match"
+        << std::setw(12) << "literal B"
+        << std::setw(13) << "matched B"
+        << std::setw(10) << "match %"
+        << std::setw(11) << "avg match"
         << '\n';
     emit_report(header.str());
 
     bool all_ok = true;
     size_t total_input = 0;
     size_t total_compressed = 0;
+    size_t total_blocks = 0;
     size_t total_tokens = 0;
     size_t total_match_tokens = 0;
     size_t total_literal_tokens = 0;
-    size_t total_match_memory = 0;
     size_t total_match_length = 0;
     double total_compress_ms = 0.0;
     double total_decompress_ms = 0.0;
@@ -588,30 +729,32 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
                 err
             );
 
-        const double factor = result.compressed_size == 0
-            ? 0.0
-            : static_cast<double>(input.size()) /
-              static_cast<double>(result.compressed_size);
-        const double avg_match_length = result.match_token_count == 0
-            ? 0.0
-            : static_cast<double>(result.match_length_total) /
-              static_cast<double>(result.match_token_count);
+        const DerivedCompressionStats derived =
+            calculate_derived_stats(input.size(), result);
 
         std::ostringstream row;
         row << std::left << std::setw(14) << path.filename().string()
-            << std::right << std::setw(13) << input.size()
-            << std::setw(13) << result.compressed_size
-            << std::setw(11) << std::fixed << std::setprecision(3) << factor
-            << std::setw(14) << std::fixed << std::setprecision(0)
-            << result.compress_ms
-            << std::setw(14) << std::fixed << std::setprecision(0)
-            << result.decompress_ms
+            << std::right << std::setw(12) << input.size()
+            << std::setw(12) << result.compressed_size
+            << std::setw(9) << std::fixed << std::setprecision(3)
+            << derived.bits_per_byte
+            << std::setw(9) << std::fixed << std::setprecision(3)
+            << derived.compression_factor
+            << std::setw(9) << std::fixed << std::setprecision(2)
+            << derived.saving_percent
+            << std::setw(12) << std::fixed << std::setprecision(2)
+            << derived.compression_mib_per_second
+            << std::setw(12) << std::fixed << std::setprecision(2)
+            << derived.decompression_mib_per_second
+            << std::setw(9) << result.block_count
             << std::setw(12) << result.token_count
             << std::setw(12) << result.match_token_count
             << std::setw(12) << result.literal_token_count
-            << std::setw(13) << result.match_memory
-            << std::setw(12) << std::fixed << std::setprecision(2)
-            << avg_match_length
+            << std::setw(13) << result.match_length_total
+            << std::setw(10) << std::fixed << std::setprecision(2)
+            << derived.match_coverage_percent
+            << std::setw(11) << std::fixed << std::setprecision(2)
+            << derived.average_match_length
             << (result.ok ? "" : "  FAIL")
             << '\n';
         emit_report(row.str());
@@ -619,54 +762,77 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
         all_ok = result.ok && all_ok;
         total_input += input.size();
         total_compressed += result.compressed_size;
+        total_blocks += result.block_count;
         total_tokens += result.token_count;
         total_match_tokens += result.match_token_count;
         total_literal_tokens += result.literal_token_count;
-        total_match_memory += result.match_memory;
         total_match_length += result.match_length_total;
         total_compress_ms += result.compress_ms;
         total_decompress_ms += result.decompress_ms;
     }
 
-    const double total_factor = total_compressed == 0
-        ? 0.0
-        : static_cast<double>(total_input) /
-          static_cast<double>(total_compressed);
-    const double total_avg_match_length = total_match_tokens == 0
-        ? 0.0
-        : static_cast<double>(total_match_length) /
-          static_cast<double>(total_match_tokens);
+    CompressionResult total_result{};
+    total_result.ok = all_ok;
+    total_result.stats_consistent = represented_size_is_consistent(
+        total_input,
+        total_literal_tokens,
+        total_match_length,
+        nullptr
+    );
+    total_result.block_count = total_blocks;
+    total_result.token_count = total_tokens;
+    total_result.match_token_count = total_match_tokens;
+    total_result.literal_token_count = total_literal_tokens;
+    total_result.match_length_total = total_match_length;
+    total_result.compressed_size = total_compressed;
+    total_result.compress_ms = total_compress_ms;
+    total_result.decompress_ms = total_decompress_ms;
+
+    const DerivedCompressionStats total_derived =
+        calculate_derived_stats(total_input, total_result);
 
     std::ostringstream summary;
     summary << '\n'
         << std::left << std::setw(14) << "TOTAL"
-        << std::right << std::setw(13) << total_input
-        << std::setw(13) << total_compressed
-        << std::setw(11) << std::fixed << std::setprecision(3)
-        << total_factor
-        << std::setw(14) << std::fixed << std::setprecision(2)
-        << total_compress_ms
-        << std::setw(14) << std::fixed << std::setprecision(2)
-        << total_decompress_ms
+        << std::right << std::setw(12) << total_input
+        << std::setw(12) << total_compressed
+        << std::setw(9) << std::fixed << std::setprecision(3)
+        << total_derived.bits_per_byte
+        << std::setw(9) << std::fixed << std::setprecision(3)
+        << total_derived.compression_factor
+        << std::setw(9) << std::fixed << std::setprecision(2)
+        << total_derived.saving_percent
+        << std::setw(12) << std::fixed << std::setprecision(2)
+        << total_derived.compression_mib_per_second
+        << std::setw(12) << std::fixed << std::setprecision(2)
+        << total_derived.decompression_mib_per_second
+        << std::setw(9) << total_blocks
         << std::setw(12) << total_tokens
         << std::setw(12) << total_match_tokens
         << std::setw(12) << total_literal_tokens
-        << std::setw(13) << total_match_memory
-        << std::setw(12) << std::fixed << std::setprecision(2)
-        << total_avg_match_length
+        << std::setw(13) << total_match_length
+        << std::setw(10) << std::fixed << std::setprecision(2)
+        << total_derived.match_coverage_percent
+        << std::setw(11) << std::fixed << std::setprecision(2)
+        << total_derived.average_match_length
         << '\n';
 
-    summary << (all_ok ? "OK, all checks passed\n"
-                       : "FAIL, some checks failed\n");
+    if (!total_result.stats_consistent) {
+        all_ok = false;
+        summary << "FAIL, corpus LZSS statistics are inconsistent\n";
+    } else {
+        summary << (all_ok ? "OK, all checks passed\n"
+                           : "FAIL, some checks failed\n");
+    }
     emit_report(summary.str());
 
     const std::string report_text = report.str();
 
-    std::ofstream history("Optimal runs.txt", std::ios::app);
+    std::ofstream history("Experiment_runs.txt", std::ios::app);
     if (history) {
         history << "\n\n" << report_text;
     } else {
-        err << "Failed to append benchmark result to Optimal runs.txt\n";
+        err << "Failed to append benchmark result to Experiment runs.txt\n";
     }
 
     return all_ok;
