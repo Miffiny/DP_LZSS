@@ -733,6 +733,72 @@ static bool read_model_frequencies(struct bio *bio, struct model *model)
     return model_set_frequencies_tans(model, frequencies);
 }
 
+static double model_symbol_cost(const struct model *model, size_t symbol);
+
+static bool add_model_coding_costs(
+    const std::vector<uint32_t>& raw_frequencies,
+    const struct model *normalized_model,
+    double *empirical_entropy_bits,
+    double *normalized_model_bits)
+{
+    if (normalized_model == nullptr ||
+        normalized_model->table == nullptr ||
+        empirical_entropy_bits == nullptr ||
+        normalized_model_bits == nullptr ||
+        raw_frequencies.size() != normalized_model->count) {
+        return false;
+    }
+
+    size_t total = 0;
+    for (uint32_t frequency : raw_frequencies) {
+        if (total >
+            std::numeric_limits<size_t>::max() -
+                static_cast<size_t>(frequency)) {
+            return false;
+        }
+        total += frequency;
+    }
+
+    if (total == 0) {
+        return true;
+    }
+
+    for (size_t symbol = 0; symbol < raw_frequencies.size(); ++symbol) {
+        const uint32_t frequency = raw_frequencies[symbol];
+        if (frequency == 0) {
+            continue;
+        }
+
+        const double symbol_count = static_cast<double>(frequency);
+        *empirical_entropy_bits +=
+            symbol_count *
+            std::log2(static_cast<double>(total) / symbol_count);
+
+        const double normalized_cost =
+            model_symbol_cost(normalized_model, symbol);
+        if (!std::isfinite(normalized_cost)) {
+            return false;
+        }
+
+        *normalized_model_bits += symbol_count * normalized_cost;
+    }
+
+    return true;
+}
+
+static size_t static_model_header_bits(const LzssTansCodec *codec)
+{
+    if (codec == nullptr) {
+        return 0;
+    }
+
+    return 32u *
+        (codec->literal_length_model.count +
+         codec->literal_model.count +
+         codec->length_model.count +
+         codec->distance_model.count);
+}
+
 static bool write_static_model_header(
     struct bio *bio,
     const LzssTansCodec *codec)
@@ -838,6 +904,15 @@ static bool collect_static_model_stats(
         update_repeat_distances(&repeat_state, sequence.match_distance);
     }
 
+    const std::vector<uint32_t> raw_literal_length_frequencies =
+        literal_length_frequencies;
+    const std::vector<uint32_t> raw_literal_frequencies =
+        literal_frequencies;
+    const std::vector<uint32_t> raw_length_frequencies =
+        length_frequencies;
+    const std::vector<uint32_t> raw_distance_frequencies =
+        distance_frequencies;
+
     if (smooth_all_symbols) {
         for (uint32_t& frequency : literal_length_frequencies) {
             if (frequency == 0) {
@@ -861,12 +936,44 @@ static bool collect_static_model_stats(
         }
     }
 
-    return model_set_frequencies_tans(
+    if (!model_set_frequencies_tans(
+            &codec->literal_length_model,
+            literal_length_frequencies) ||
+        !model_set_frequencies_tans(
+            &codec->literal_model,
+            literal_frequencies) ||
+        !model_set_frequencies_tans(
+            &codec->length_model,
+            length_frequencies) ||
+        !model_set_frequencies_tans(
+            &codec->distance_model,
+            distance_frequencies)) {
+        return false;
+    }
+
+    codec->empirical_entropy_bits = 0.0;
+    codec->normalized_model_bits = 0.0;
+
+    return add_model_coding_costs(
+               raw_literal_length_frequencies,
                &codec->literal_length_model,
-               literal_length_frequencies) &&
-           model_set_frequencies_tans(&codec->literal_model, literal_frequencies) &&
-           model_set_frequencies_tans(&codec->length_model, length_frequencies) &&
-           model_set_frequencies_tans(&codec->distance_model, distance_frequencies);
+               &codec->empirical_entropy_bits,
+               &codec->normalized_model_bits) &&
+           add_model_coding_costs(
+               raw_literal_frequencies,
+               &codec->literal_model,
+               &codec->empirical_entropy_bits,
+               &codec->normalized_model_bits) &&
+           add_model_coding_costs(
+               raw_length_frequencies,
+               &codec->length_model,
+               &codec->empirical_entropy_bits,
+               &codec->normalized_model_bits) &&
+           add_model_coding_costs(
+               raw_distance_frequencies,
+               &codec->distance_model,
+               &codec->empirical_entropy_bits,
+               &codec->normalized_model_bits);
 }
 
 static bool init_tans_model_if_used(
@@ -1359,13 +1466,19 @@ void lzss_tans_codec_destroy(
 bool lzss_tans_encode_stream(
     LzssTansCodec *codec,
     struct bio *bio,
-    const LzssSequenceStream *stream)
+    const LzssSequenceStream *stream,
+    LzssTansStreamStats *stats)
 {
     if (!lzss_tans_build_models(codec, stream, false)) {
         return false;
     }
 
-    return lzss_tans_encode_stream_with_current_models(codec, bio, stream);
+    return lzss_tans_encode_stream_with_current_models(
+        codec,
+        bio,
+        stream,
+        stats
+    );
 }
 
 bool lzss_tans_build_models(
@@ -1386,7 +1499,8 @@ bool lzss_tans_build_models(
 bool lzss_tans_encode_stream_with_current_models(
     LzssTansCodec *codec,
     struct bio *bio,
-    const LzssSequenceStream *stream)
+    const LzssSequenceStream *stream,
+    LzssTansStreamStats *stats)
 {
     if (codec == nullptr ||
         bio == nullptr ||
@@ -1399,6 +1513,8 @@ bool lzss_tans_encode_stream_with_current_models(
         return false;
     }
 
+    const uint32_t *payload_begin = bio->ptr;
+
     if (!sequence_layout_is_valid(codec, stream) ||
         !write_u32(bio, sequence_count_u32) ||
         !write_static_model_header(bio, codec)) {
@@ -1407,7 +1523,24 @@ bool lzss_tans_encode_stream_with_current_models(
 
     size_t symbol_count = stream->sequences.size();
     size_t extra_bit_capacity = 32;
+    size_t exact_extra_bit_count = 0;
     std::vector<size_t> distance_symbols;
+    std::vector<uint32_t> actual_literal_length_frequencies(
+        codec->literal_length_model.count,
+        0
+    );
+    std::vector<uint32_t> actual_literal_frequencies(
+        codec->literal_model.count,
+        0
+    );
+    std::vector<uint32_t> actual_length_frequencies(
+        codec->length_model.count,
+        0
+    );
+    std::vector<uint32_t> actual_distance_frequencies(
+        codec->distance_model.count,
+        0
+    );
     RepeatDistanceState symbol_repeat_state{};
 
     for (size_t i = 0; i < stream->sequences.size(); ++i) {
@@ -1419,6 +1552,38 @@ bool lzss_tans_encode_stream_with_current_models(
         }
         symbol_count += sequence.lit_length;
 
+        size_t literal_length_symbol = 0;
+        const DeflateClass *literal_length_class = nullptr;
+        if (!find_class_for_value(
+                LITERAL_LENGTH_CLASSES,
+                array_count(LITERAL_LENGTH_CLASSES),
+                0,
+                UINT32_MAX,
+                sequence.lit_length,
+                &literal_length_symbol,
+                &literal_length_class)) {
+            return false;
+        }
+        (void)literal_length_symbol;
+
+        if (literal_length_symbol >= actual_literal_length_frequencies.size() ||
+            actual_literal_length_frequencies[literal_length_symbol] ==
+                UINT32_MAX) {
+            return false;
+        }
+        ++actual_literal_length_frequencies[literal_length_symbol];
+
+        for (uint32_t literal_index = 0;
+             literal_index < sequence.lit_length;
+             ++literal_index) {
+            const uint8_t literal = sequence.literals_ptr[literal_index];
+            if (literal >= actual_literal_frequencies.size() ||
+                actual_literal_frequencies[literal] == UINT32_MAX) {
+                return false;
+            }
+            ++actual_literal_frequencies[literal];
+        }
+
         if (extra_bit_capacity >
             std::numeric_limits<size_t>::max() -
                 codec->literal_length_extra_bit_count) {
@@ -1426,9 +1591,35 @@ bool lzss_tans_encode_stream_with_current_models(
         }
         extra_bit_capacity += codec->literal_length_extra_bit_count;
 
+        if (exact_extra_bit_count >
+            std::numeric_limits<size_t>::max() -
+                literal_length_class->extra_bits) {
+            return false;
+        }
+        exact_extra_bit_count += literal_length_class->extra_bits;
+
         if (i == 0) {
             continue;
         }
+
+        size_t length_symbol = 0;
+        const DeflateClass *length_class = nullptr;
+        if (!find_class_for_value(
+                LENGTH_CLASSES,
+                array_count(LENGTH_CLASSES),
+                static_cast<uint32_t>(codec->config.min_match_length),
+                static_cast<uint32_t>(codec->config.max_match_length),
+                sequence.match_length,
+                &length_symbol,
+                &length_class)) {
+            return false;
+        }
+        (void)length_symbol;
+        if (length_symbol >= actual_length_frequencies.size() ||
+            actual_length_frequencies[length_symbol] == UINT32_MAX) {
+            return false;
+        }
+        ++actual_length_frequencies[length_symbol];
 
         size_t distance_symbol = 0;
         const DeflateClass *distance_class = nullptr;
@@ -1440,8 +1631,12 @@ bool lzss_tans_encode_stream_with_current_models(
                 &distance_class)) {
             return false;
         }
-        (void)distance_class;
         distance_symbols.push_back(distance_symbol);
+        if (distance_symbol >= actual_distance_frequencies.size() ||
+            actual_distance_frequencies[distance_symbol] == UINT32_MAX) {
+            return false;
+        }
+        ++actual_distance_frequencies[distance_symbol];
         update_repeat_distances(&symbol_repeat_state, sequence.match_distance);
 
         if (symbol_count >
@@ -1459,6 +1654,48 @@ bool lzss_tans_encode_stream_with_current_models(
             return false;
         }
         extra_bit_capacity += match_extra_bits;
+
+        size_t exact_match_extra_bits = length_class->extra_bits;
+        if (distance_class != nullptr) {
+            if (exact_match_extra_bits >
+                std::numeric_limits<size_t>::max() -
+                    distance_class->extra_bits) {
+                return false;
+            }
+            exact_match_extra_bits += distance_class->extra_bits;
+        }
+
+        if (exact_extra_bit_count >
+            std::numeric_limits<size_t>::max() - exact_match_extra_bits) {
+            return false;
+        }
+        exact_extra_bit_count += exact_match_extra_bits;
+    }
+
+    double empirical_entropy_bits = 0.0;
+    double normalized_model_bits = 0.0;
+    if (stats != nullptr &&
+        (!add_model_coding_costs(
+             actual_literal_length_frequencies,
+             &codec->literal_length_model,
+             &empirical_entropy_bits,
+             &normalized_model_bits) ||
+         !add_model_coding_costs(
+             actual_literal_frequencies,
+             &codec->literal_model,
+             &empirical_entropy_bits,
+             &normalized_model_bits) ||
+         !add_model_coding_costs(
+             actual_length_frequencies,
+             &codec->length_model,
+             &empirical_entropy_bits,
+             &normalized_model_bits) ||
+         !add_model_coding_costs(
+             actual_distance_frequencies,
+             &codec->distance_model,
+             &empirical_entropy_bits,
+             &normalized_model_bits))) {
+        return false;
     }
 
     const size_t extra_word_capacity =
@@ -1603,6 +1840,37 @@ bool lzss_tans_encode_stream_with_current_models(
 
     for (size_t i = 0; i < extra_word_count; ++i) {
         write_u32(bio, extra_words[i]);
+    }
+
+    if (stats != nullptr) {
+        const size_t rounded_payload_bytes =
+            static_cast<size_t>(bio->ptr - payload_begin) *
+            sizeof(uint32_t);
+        const size_t model_header_bits = static_model_header_bits(codec);
+        const size_t fixed_payload_header_bits = 32u + 64u;
+        const size_t exact_payload_bits =
+            fixed_payload_header_bits +
+            model_header_bits +
+            tans_bit_count +
+            exact_extra_bit_count;
+        const double normalization_loss_bits =
+            normalized_model_bits - empirical_entropy_bits;
+
+        stats->model_header_bits = model_header_bits;
+        stats->tans_stream_bits = tans_bit_count;
+        stats->extra_stream_bits = exact_extra_bit_count;
+        stats->exact_payload_bits = exact_payload_bits;
+        stats->rounded_payload_bytes = rounded_payload_bytes;
+        stats->total_stream_bytes = rounded_payload_bytes;
+        stats->padding_bits =
+            rounded_payload_bytes * 8u >= exact_payload_bits
+                ? rounded_payload_bytes * 8u - exact_payload_bits
+                : 0;
+        stats->empirical_entropy_bits = empirical_entropy_bits;
+        stats->normalization_loss_bits = normalization_loss_bits;
+        stats->tans_coder_overhead_bits =
+            static_cast<double>(tans_bit_count) -
+            normalized_model_bits;
     }
 
     return true;

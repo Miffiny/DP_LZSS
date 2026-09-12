@@ -17,6 +17,8 @@ struct LzssAcBlockStream {
     size_t block_size;
     std::vector<LzssAcBlock> blocks;
     LzssBlockStats stats;
+    LzssPayloadStats payload_stats;
+    LzssBlockTimings timings;
 };
 
 void lzss_ac_block_stream_init(LzssAcBlockStream *stream);
@@ -37,4 +39,5 @@ bool lzss_ac_decode_blocks(
     const LzssAcBlockStream *stream,
     size_t max_workers,
     const LzssConfig *config,
-    ByteBuffer *out);
+    ByteBuffer *out,
+    LzssBlockTimings *timings = nullptr);

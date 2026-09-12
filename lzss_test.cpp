@@ -7,6 +7,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -17,6 +18,19 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <psapi.h>
+#else
+#include <sys/resource.h>
+#endif
+
 enum EntropyCodec {
     ENTROPY_CODEC_TANS,
     ENTROPY_CODEC_ADAPTIVE_AC
@@ -26,12 +40,14 @@ struct BenchmarkConfig {
     std::filesystem::path dataset_dir;
     LzssConfig lzss;
     EntropyCodec entropy_codec;
+    LzssTansTableMode tans_table_mode;
     size_t block_size;
     size_t max_workers;
 };
 
 struct CompressionResult {
     bool ok;
+    bool content_match;
     bool stats_consistent;
     size_t block_count;
     size_t token_count;
@@ -39,9 +55,17 @@ struct CompressionResult {
     size_t literal_token_count;
     size_t match_memory;
     size_t match_length_total;
+    size_t rep0_count;
+    size_t rep1_count;
+    size_t rep2_count;
+    size_t new_distance_count;
     size_t compressed_size;
+    LzssPayloadStats payload_stats;
+    LzssBlockTimings timings;
     double compress_ms;
     double decompress_ms;
+    size_t peak_rss_bytes;
+    std::string status;
 };
 
 struct DerivedCompressionStats {
@@ -55,7 +79,13 @@ struct DerivedCompressionStats {
     double average_match_length;
     double average_literals_per_sequence;
     double matches_per_kib;
+    double repeat_distance_hit_percent;
 };
+
+static const char *entropy_codec_name(EntropyCodec entropy_codec);
+static const char *parse_mode_name(LzssParseMode parse_mode);
+static const char *tans_table_mode_name(LzssTansTableMode table_mode);
+static std::string benchmark_mode_name(const BenchmarkConfig& config);
 
 static double throughput_mib_per_second(size_t input_size, double elapsed_ms)
 {
@@ -77,12 +107,12 @@ static DerivedCompressionStats calculate_derived_stats(
 
     if (input_size > 0) {
         stats.bits_per_byte =
-            8.0 * static_cast<double>(result.compressed_size) /
+            static_cast<double>(result.payload_stats.exact_payload_bits) /
             static_cast<double>(input_size);
         stats.saving_percent =
             100.0 *
             (1.0 -
-             static_cast<double>(result.compressed_size) /
+             static_cast<double>(result.payload_stats.rounded_payload_bytes) /
              static_cast<double>(input_size));
         stats.match_coverage_percent =
             100.0 * static_cast<double>(result.match_length_total) /
@@ -95,10 +125,10 @@ static DerivedCompressionStats calculate_derived_stats(
             static_cast<double>(input_size);
     }
 
-    if (result.compressed_size > 0) {
+    if (result.payload_stats.rounded_payload_bytes > 0) {
         stats.compression_factor =
             static_cast<double>(input_size) /
-            static_cast<double>(result.compressed_size);
+            static_cast<double>(result.payload_stats.rounded_payload_bytes);
     }
 
     if (result.match_token_count > 0) {
@@ -111,6 +141,14 @@ static DerivedCompressionStats calculate_derived_stats(
         stats.average_literals_per_sequence =
             static_cast<double>(result.literal_token_count) /
             static_cast<double>(result.token_count);
+    }
+
+    if (result.match_token_count > 0) {
+        const size_t repeat_distance_hits =
+            result.rep0_count + result.rep1_count + result.rep2_count;
+        stats.repeat_distance_hit_percent =
+            100.0 * static_cast<double>(repeat_distance_hits) /
+            static_cast<double>(result.match_token_count);
     }
 
     stats.compression_mib_per_second =
@@ -152,6 +190,203 @@ static bool sequence_statistics_are_consistent(
     );
 }
 
+static size_t current_peak_rss_bytes()
+{
+#ifdef _WIN32
+    using GetProcessMemoryInfoFn =
+        BOOL (WINAPI *)(HANDLE, PPROCESS_MEMORY_COUNTERS, DWORD);
+
+    auto load_memory_info_proc = [](HMODULE module, const char *name) {
+        GetProcessMemoryInfoFn fn = nullptr;
+        if (module == nullptr) {
+            return fn;
+        }
+
+        FARPROC proc = GetProcAddress(module, name);
+        if (proc != nullptr && sizeof(proc) == sizeof(fn)) {
+            std::memcpy(&fn, &proc, sizeof(fn));
+        }
+
+        return fn;
+    };
+
+    GetProcessMemoryInfoFn get_process_memory_info = nullptr;
+
+    HMODULE psapi = GetModuleHandleA("psapi.dll");
+    if (psapi == nullptr) {
+        psapi = LoadLibraryA("psapi.dll");
+    }
+    if (psapi != nullptr) {
+        get_process_memory_info =
+            load_memory_info_proc(psapi, "GetProcessMemoryInfo");
+    }
+
+    if (get_process_memory_info == nullptr) {
+        HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+        if (kernel32 != nullptr) {
+            get_process_memory_info =
+                load_memory_info_proc(kernel32, "K32GetProcessMemoryInfo");
+        }
+    }
+
+    PROCESS_MEMORY_COUNTERS counters{};
+    counters.cb = sizeof(counters);
+    if (get_process_memory_info != nullptr &&
+        get_process_memory_info(
+            GetCurrentProcess(),
+            &counters,
+            sizeof(counters))) {
+        return static_cast<size_t>(counters.PeakWorkingSetSize);
+    }
+
+    return 0;
+#else
+    struct rusage usage {};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+        return 0;
+    }
+
+#if defined(__APPLE__)
+    return static_cast<size_t>(usage.ru_maxrss);
+#else
+    return static_cast<size_t>(usage.ru_maxrss) * 1024u;
+#endif
+#endif
+}
+
+static const char *csv_header_text()
+{
+    return
+        "mode,entropy_codec,parse_mode,tans_table_mode,"
+        "file,input_bytes,block_size,blocks,"
+        "exact_payload_bits,rounded_payload_bytes,model_header_bits,"
+        "tans_stream_bits,extra_stream_bits,padding_bits,"
+        "total_stream_bytes,"
+        "parse_ms,model_build_ms,tans_encode_ms,total_compress_ms,"
+        "tans_decode_ms,lzss_reconstruct_ms,total_decompress_ms,"
+        "bits_per_byte,compression_factor,compression_mib_s,"
+        "decompression_mib_s,peak_rss_bytes,"
+        "sequences,literal_bytes,matched_bytes,matches,"
+        "avg_match_length,avg_literals_per_sequence,"
+        "rep0_count,rep1_count,rep2_count,new_distance_count,"
+        "repeat_distance_hit_pct,"
+        "empirical_entropy_bits,normalization_loss_bits,"
+        "tans_coder_overhead_bits,content_match,status";
+}
+
+static bool csv_file_needs_header(const std::filesystem::path& path)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file || file.peek() == std::ifstream::traits_type::eof()) {
+        return true;
+    }
+
+    std::string first_line;
+    std::getline(file, first_line);
+    if (!first_line.empty() && first_line.back() == '\r') {
+        first_line.pop_back();
+    }
+
+    return first_line != csv_header_text();
+}
+
+static void write_csv_escaped(std::ostream& csv, const std::string& value)
+{
+    const bool needs_quotes =
+        value.find_first_of(",\"\r\n") != std::string::npos;
+    if (!needs_quotes) {
+        csv << value;
+        return;
+    }
+
+    csv << '"';
+    for (char ch : value) {
+        if (ch == '"') {
+            csv << "\"\"";
+        } else {
+            csv << ch;
+        }
+    }
+    csv << '"';
+}
+
+static void write_csv_header(std::ostream& csv)
+{
+    csv << csv_header_text() << '\n';
+}
+
+static void write_csv_row(
+    std::ostream& csv,
+    const BenchmarkConfig& config,
+    const std::string& file_name,
+    size_t input_size,
+    size_t block_size,
+    const CompressionResult& result,
+    const DerivedCompressionStats& derived)
+{
+    const std::streamsize old_precision = csv.precision();
+    const std::ios::fmtflags old_flags = csv.flags();
+
+    csv << std::fixed << std::setprecision(6);
+    write_csv_escaped(csv, benchmark_mode_name(config));
+    csv << ',';
+    write_csv_escaped(csv, entropy_codec_name(config.entropy_codec));
+    csv << ',';
+    write_csv_escaped(csv, parse_mode_name(config.lzss.parse_mode));
+    csv << ',';
+    write_csv_escaped(
+        csv,
+        config.entropy_codec == ENTROPY_CODEC_TANS
+            ? tans_table_mode_name(config.tans_table_mode)
+            : ""
+    );
+    csv << ',';
+    write_csv_escaped(csv, file_name);
+    csv << ','
+        << input_size << ','
+        << block_size << ','
+        << result.block_count << ','
+        << result.payload_stats.exact_payload_bits << ','
+        << result.payload_stats.rounded_payload_bytes << ','
+        << result.payload_stats.model_header_bits << ','
+        << result.payload_stats.tans_stream_bits << ','
+        << result.payload_stats.extra_stream_bits << ','
+        << result.payload_stats.padding_bits << ','
+        << result.payload_stats.total_stream_bytes << ','
+        << result.timings.parse_ms << ','
+        << result.timings.model_build_ms << ','
+        << result.timings.entropy_encode_ms << ','
+        << result.compress_ms << ','
+        << result.timings.entropy_decode_ms << ','
+        << result.timings.reconstruct_ms << ','
+        << result.decompress_ms << ','
+        << derived.bits_per_byte << ','
+        << derived.compression_factor << ','
+        << derived.compression_mib_per_second << ','
+        << derived.decompression_mib_per_second << ','
+        << result.peak_rss_bytes << ','
+        << result.token_count << ','
+        << result.literal_token_count << ','
+        << result.match_length_total << ','
+        << result.match_token_count << ','
+        << derived.average_match_length << ','
+        << derived.average_literals_per_sequence << ','
+        << result.rep0_count << ','
+        << result.rep1_count << ','
+        << result.rep2_count << ','
+        << result.new_distance_count << ','
+        << derived.repeat_distance_hit_percent << ','
+        << result.payload_stats.empirical_entropy_bits << ','
+        << result.payload_stats.normalization_loss_bits << ','
+        << result.payload_stats.tans_coder_overhead_bits << ','
+        << (result.content_match ? 1 : 0) << ',';
+    write_csv_escaped(csv, result.status);
+    csv << '\n';
+
+    csv.flags(old_flags);
+    csv.precision(old_precision);
+}
+
 static const char *entropy_codec_name(EntropyCodec entropy_codec)
 {
     switch (entropy_codec) {
@@ -162,6 +397,35 @@ static const char *entropy_codec_name(EntropyCodec entropy_codec)
     }
 
     return "unknown";
+}
+
+static const char *tans_table_mode_name(LzssTansTableMode table_mode)
+{
+    switch (table_mode) {
+    case LZSS_TANS_TABLE_LAZY:
+        return "lazy";
+    case LZSS_TANS_TABLE_REBUILD:
+        return "rebuild";
+    }
+
+    return "unknown";
+}
+
+static std::string benchmark_mode_name(const BenchmarkConfig& config)
+{
+    if (config.entropy_codec == ENTROPY_CODEC_TANS) {
+        if (config.lzss.parse_mode == LZSS_PARSE_OPTIMAL &&
+            config.tans_table_mode == LZSS_TANS_TABLE_REBUILD) {
+            return "optimal_rebuild";
+        }
+
+        return parse_mode_name(config.lzss.parse_mode);
+    }
+
+    std::string name = entropy_codec_name(config.entropy_codec);
+    name += "_";
+    name += parse_mode_name(config.lzss.parse_mode);
+    return name;
 }
 
 static std::string trim(const std::string& value)
@@ -365,6 +629,30 @@ static bool parse_entropy_codec(
     return false;
 }
 
+static bool parse_tans_table_mode(
+    const std::unordered_map<std::string, std::string>& values,
+    LzssTansTableMode *out,
+    std::ostream& err)
+{
+    const auto it = values.find("tans_table_mode");
+    const std::string value =
+        it == values.end() || it->second.empty()
+            ? "lazy"
+            : to_lower(it->second);
+
+    if (value == "lazy") {
+        *out = LZSS_TANS_TABLE_LAZY;
+        return true;
+    }
+    if (value == "rebuild") {
+        *out = LZSS_TANS_TABLE_REBUILD;
+        return true;
+    }
+
+    err << "Invalid tans_table_mode config value: " << it->second << '\n';
+    return false;
+}
+
 static bool load_benchmark_config(
     const std::filesystem::path& path,
     BenchmarkConfig *config,
@@ -426,7 +714,8 @@ static bool load_benchmark_config(
         !parse_parse_mode(values, &config->lzss.parse_mode, err) ||
         !parse_hash_mode(values, &config->lzss.hash_mode, err) ||
         !parse_distance_coding(values, &config->lzss.distance_coding, err) ||
-        !parse_entropy_codec(values, &config->entropy_codec, err)) {
+        !parse_entropy_codec(values, &config->entropy_codec, err) ||
+        !parse_tans_table_mode(values, &config->tans_table_mode, err)) {
         return false;
     }
 
@@ -492,6 +781,37 @@ static void copy_block_stats_to_result(
     result->literal_token_count = stats.literal_token_count;
     result->match_memory = stats.match_memory;
     result->match_length_total = stats.match_length_total;
+    result->rep0_count = stats.rep0_count;
+    result->rep1_count = stats.rep1_count;
+    result->rep2_count = stats.rep2_count;
+    result->new_distance_count = stats.new_distance_count;
+}
+
+static void add_timings(
+    LzssBlockTimings *dst,
+    const LzssBlockTimings& src)
+{
+    dst->parse_ms += src.parse_ms;
+    dst->model_build_ms += src.model_build_ms;
+    dst->entropy_encode_ms += src.entropy_encode_ms;
+    dst->entropy_decode_ms += src.entropy_decode_ms;
+    dst->reconstruct_ms += src.reconstruct_ms;
+}
+
+static void add_payload_stats(
+    LzssPayloadStats *dst,
+    const LzssPayloadStats& src)
+{
+    dst->exact_payload_bits += src.exact_payload_bits;
+    dst->rounded_payload_bytes += src.rounded_payload_bytes;
+    dst->model_header_bits += src.model_header_bits;
+    dst->tans_stream_bits += src.tans_stream_bits;
+    dst->extra_stream_bits += src.extra_stream_bits;
+    dst->padding_bits += src.padding_bits;
+    dst->total_stream_bytes += src.total_stream_bytes;
+    dst->empirical_entropy_bits += src.empirical_entropy_bits;
+    dst->normalization_loss_bits += src.normalization_loss_bits;
+    dst->tans_coder_overhead_bits += src.tans_coder_overhead_bits;
 }
 
 static CompressionResult compress_decompress_file(
@@ -500,6 +820,7 @@ static CompressionResult compress_decompress_file(
     EntropyCodec entropy_codec,
     size_t block_size,
     size_t max_workers,
+    LzssTansTableMode tans_table_mode,
     std::ostream& err)
 {
     CompressionResult result{};
@@ -525,6 +846,8 @@ static CompressionResult compress_decompress_file(
             &ac_block_stream
         );
         copy_block_stats_to_result(ac_block_stream.stats, &result);
+        result.payload_stats = ac_block_stream.payload_stats;
+        result.timings = ac_block_stream.timings;
         result.compressed_size =
             lzss_ac_block_stream_compressed_size(&ac_block_stream);
     } else {
@@ -534,11 +857,22 @@ static CompressionResult compress_decompress_file(
             block_size,
             max_workers,
             &config,
+            tans_table_mode,
             &tans_block_stream
         );
         copy_block_stats_to_result(tans_block_stream.stats, &result);
+        result.payload_stats = tans_block_stream.payload_stats;
+        result.timings = tans_block_stream.timings;
         result.compressed_size =
             lzss_tans_block_stream_compressed_size(&tans_block_stream);
+    }
+
+    if (result.payload_stats.rounded_payload_bytes == 0 &&
+        result.compressed_size > 0) {
+        result.payload_stats.rounded_payload_bytes = result.compressed_size;
+        result.payload_stats.total_stream_bytes = result.compressed_size;
+        result.payload_stats.exact_payload_bits =
+            result.compressed_size * 8u;
     }
 
     const auto compress_end = std::chrono::steady_clock::now();
@@ -549,6 +883,8 @@ static CompressionResult compress_decompress_file(
         ).count();
 
     if (!ok) {
+        result.status = "compression_failed";
+        result.peak_rss_bytes = current_peak_rss_bytes();
         err << "  block " << entropy_codec_name(entropy_codec)
             << " compression failed\n";
         lzss_tans_block_stream_clear(&tans_block_stream);
@@ -560,20 +896,23 @@ static CompressionResult compress_decompress_file(
     buffer_init(&decoded_bytes);
     buffer_init_with_capacity(&decoded_bytes, input.size());
 
+    LzssBlockTimings decode_timings{};
     const auto decompress_start = std::chrono::steady_clock::now();
     if (entropy_codec == ENTROPY_CODEC_ADAPTIVE_AC) {
         ok = lzss_ac_decode_blocks(
             &ac_block_stream,
             max_workers,
             &config,
-            &decoded_bytes
+            &decoded_bytes,
+            &decode_timings
         );
     } else {
         ok = lzss_tans_decode_blocks(
             &tans_block_stream,
             max_workers,
             &config,
-            &decoded_bytes
+            &decoded_bytes,
+            &decode_timings
         );
     }
     const auto decompress_end = std::chrono::steady_clock::now();
@@ -582,10 +921,12 @@ static CompressionResult compress_decompress_file(
         std::chrono::duration<double, std::milli>(
             decompress_end - decompress_start
         ).count();
+    add_timings(&result.timings, decode_timings);
 
     const bool same_size = decoded_bytes.size == input.size();
     const bool same_data = same_size &&
         std::equal(input.begin(), input.end(), decoded_bytes.data);
+    result.content_match = same_data;
 
     result.stats_consistent =
         sequence_statistics_are_consistent(input.size(), result);
@@ -621,10 +962,20 @@ static CompressionResult compress_decompress_file(
     }
 
     result.ok = ok && same_data && result.stats_consistent;
+    if (result.ok) {
+        result.status = "ok";
+    } else if (!ok) {
+        result.status = "decompression_failed";
+    } else if (!same_data) {
+        result.status = "content_mismatch";
+    } else {
+        result.status = "stats_mismatch";
+    }
 
     buffer_free(&decoded_bytes);
     lzss_tans_block_stream_clear(&tans_block_stream);
     lzss_ac_block_stream_clear(&ac_block_stream);
+    result.peak_rss_bytes = current_peak_rss_bytes();
     return result;
 }
 
@@ -657,12 +1008,22 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
         return false;
     }
 
-    std::ostringstream report;
     auto emit_report = [&](const std::string& text) {
-        report << text;
         out << text;
         out.flush();
     };
+
+    const std::filesystem::path csv_path = "Experiment_runs.csv";
+    const bool needs_csv_header = csv_file_needs_header(csv_path);
+    std::ofstream csv(csv_path, std::ios::app);
+    if (csv) {
+        if (needs_csv_header) {
+            write_csv_header(csv);
+        }
+    } else {
+        err << "Failed to append benchmark result to "
+            << csv_path.string() << '\n';
+    }
 
     std::ostringstream header;
     header << "Silesia benchmark\n";
@@ -673,6 +1034,11 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
     header << "Match length = " << config.min_match_length << ".."
         << config.max_match_length << " bytes\n";
     header << "Parse mode = " << parse_mode_name(config.parse_mode) << "\n";
+    if (benchmark_config.entropy_codec == ENTROPY_CODEC_TANS) {
+        header << "tANS table mode = "
+            << tans_table_mode_name(benchmark_config.tans_table_mode)
+            << "\n";
+    }
     header << "Hash mode = " << hash_mode_name(config.hash_mode) << "\n";
     header << "Distance coding = "
         << distance_coding_name(config.distance_coding) << "\n";
@@ -700,6 +1066,7 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
     emit_report(header.str());
 
     bool all_ok = true;
+    bool all_content_match = true;
     size_t total_input = 0;
     size_t total_compressed = 0;
     size_t total_blocks = 0;
@@ -707,6 +1074,13 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
     size_t total_match_tokens = 0;
     size_t total_literal_tokens = 0;
     size_t total_match_length = 0;
+    size_t total_rep0_count = 0;
+    size_t total_rep1_count = 0;
+    size_t total_rep2_count = 0;
+    size_t total_new_distance_count = 0;
+    size_t peak_rss_bytes = 0;
+    LzssPayloadStats total_payload_stats{};
+    LzssBlockTimings total_timings{};
     double total_compress_ms = 0.0;
     double total_decompress_ms = 0.0;
 
@@ -726,16 +1100,29 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
                 benchmark_config.entropy_codec,
                 benchmark_config.block_size,
                 benchmark_config.max_workers,
+                benchmark_config.tans_table_mode,
                 err
             );
 
         const DerivedCompressionStats derived =
             calculate_derived_stats(input.size(), result);
 
+        if (csv) {
+            write_csv_row(
+                csv,
+                benchmark_config,
+                path.filename().string(),
+                input.size(),
+                benchmark_config.block_size,
+                result,
+                derived
+            );
+        }
+
         std::ostringstream row;
         row << std::left << std::setw(14) << path.filename().string()
             << std::right << std::setw(12) << input.size()
-            << std::setw(12) << result.compressed_size
+            << std::setw(12) << result.payload_stats.rounded_payload_bytes
             << std::setw(9) << std::fixed << std::setprecision(3)
             << derived.bits_per_byte
             << std::setw(9) << std::fixed << std::setprecision(3)
@@ -760,13 +1147,21 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
         emit_report(row.str());
 
         all_ok = result.ok && all_ok;
+        all_content_match = result.content_match && all_content_match;
         total_input += input.size();
-        total_compressed += result.compressed_size;
+        total_compressed += result.payload_stats.rounded_payload_bytes;
         total_blocks += result.block_count;
         total_tokens += result.token_count;
         total_match_tokens += result.match_token_count;
         total_literal_tokens += result.literal_token_count;
         total_match_length += result.match_length_total;
+        total_rep0_count += result.rep0_count;
+        total_rep1_count += result.rep1_count;
+        total_rep2_count += result.rep2_count;
+        total_new_distance_count += result.new_distance_count;
+        peak_rss_bytes = std::max(peak_rss_bytes, result.peak_rss_bytes);
+        add_payload_stats(&total_payload_stats, result.payload_stats);
+        add_timings(&total_timings, result.timings);
         total_compress_ms += result.compress_ms;
         total_decompress_ms += result.decompress_ms;
     }
@@ -784,9 +1179,17 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
     total_result.match_token_count = total_match_tokens;
     total_result.literal_token_count = total_literal_tokens;
     total_result.match_length_total = total_match_length;
+    total_result.rep0_count = total_rep0_count;
+    total_result.rep1_count = total_rep1_count;
+    total_result.rep2_count = total_rep2_count;
+    total_result.new_distance_count = total_new_distance_count;
     total_result.compressed_size = total_compressed;
+    total_result.payload_stats = total_payload_stats;
+    total_result.timings = total_timings;
     total_result.compress_ms = total_compress_ms;
     total_result.decompress_ms = total_decompress_ms;
+    total_result.content_match = all_content_match;
+    total_result.peak_rss_bytes = peak_rss_bytes;
 
     const DerivedCompressionStats total_derived =
         calculate_derived_stats(total_input, total_result);
@@ -824,16 +1227,22 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
         summary << (all_ok ? "OK, all checks passed\n"
                            : "FAIL, some checks failed\n");
     }
-    emit_report(summary.str());
 
-    const std::string report_text = report.str();
-
-    std::ofstream history("Experiment_runs.txt", std::ios::app);
-    if (history) {
-        history << "\n\n" << report_text;
-    } else {
-        err << "Failed to append benchmark result to Experiment runs.txt\n";
+    total_result.ok = all_ok && total_result.stats_consistent;
+    total_result.status = total_result.ok ? "ok" : "fail";
+    if (csv) {
+        write_csv_row(
+            csv,
+            benchmark_config,
+            "TOTAL",
+            total_input,
+            benchmark_config.block_size,
+            total_result,
+            total_derived
+        );
     }
+
+    emit_report(summary.str());
 
     return all_ok;
 }

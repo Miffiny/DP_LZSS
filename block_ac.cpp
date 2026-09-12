@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <thread>
@@ -59,7 +60,17 @@ struct TansCodecGuardForCost {
 struct EncodedAcBlockResult {
     std::vector<uint32_t> compressed_words;
     LzssBlockStats stats{};
+    LzssPayloadStats payload_stats{};
+    LzssBlockTimings timings{};
 };
+
+static double elapsed_ms_since(
+    const std::chrono::steady_clock::time_point& start)
+{
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start
+    ).count();
+}
 
 static size_t block_count_for_size(size_t input_size, size_t block_size)
 {
@@ -105,6 +116,7 @@ static void collect_sequence_stats(
     LzssBlockStats *stats)
 {
     stats->token_count = stream.sequences.size();
+    uint32_t repeat_distances[3] = {0, 0, 0};
 
     for (const LzssSequence& sequence : stream.sequences) {
         stats->literal_token_count += sequence.lit_length;
@@ -115,6 +127,35 @@ static void collect_sequence_stats(
                 sizeof(sequence.match_distance) +
                 sizeof(sequence.match_length);
             stats->match_length_total += sequence.match_length;
+
+            size_t repeat_index = 3;
+            for (size_t i = 0; i < 3; ++i) {
+                if (repeat_distances[i] == sequence.match_distance) {
+                    repeat_index = i;
+                    break;
+                }
+            }
+
+            if (repeat_index == 0) {
+                stats->rep0_count++;
+            } else if (repeat_index == 1) {
+                stats->rep1_count++;
+            } else if (repeat_index == 2) {
+                stats->rep2_count++;
+            } else {
+                stats->new_distance_count++;
+            }
+
+            const uint32_t distance = sequence.match_distance;
+            if (repeat_index < 3) {
+                for (size_t i = repeat_index; i > 0; --i) {
+                    repeat_distances[i] = repeat_distances[i - 1];
+                }
+            } else {
+                repeat_distances[2] = repeat_distances[1];
+                repeat_distances[1] = repeat_distances[0];
+            }
+            repeat_distances[0] = distance;
         }
     }
 }
@@ -126,6 +167,37 @@ static void add_stats(LzssBlockStats *dst, const LzssBlockStats& src)
     dst->literal_token_count += src.literal_token_count;
     dst->match_memory += src.match_memory;
     dst->match_length_total += src.match_length_total;
+    dst->rep0_count += src.rep0_count;
+    dst->rep1_count += src.rep1_count;
+    dst->rep2_count += src.rep2_count;
+    dst->new_distance_count += src.new_distance_count;
+}
+
+static void add_payload_stats(
+    LzssPayloadStats *dst,
+    const LzssPayloadStats& src)
+{
+    dst->exact_payload_bits += src.exact_payload_bits;
+    dst->rounded_payload_bytes += src.rounded_payload_bytes;
+    dst->model_header_bits += src.model_header_bits;
+    dst->tans_stream_bits += src.tans_stream_bits;
+    dst->extra_stream_bits += src.extra_stream_bits;
+    dst->padding_bits += src.padding_bits;
+    dst->total_stream_bytes += src.total_stream_bytes;
+    dst->empirical_entropy_bits += src.empirical_entropy_bits;
+    dst->normalization_loss_bits += src.normalization_loss_bits;
+    dst->tans_coder_overhead_bits += src.tans_coder_overhead_bits;
+}
+
+static void add_timings(
+    LzssBlockTimings *dst,
+    const LzssBlockTimings& src)
+{
+    dst->parse_ms += src.parse_ms;
+    dst->model_build_ms += src.model_build_ms;
+    dst->entropy_encode_ms += src.entropy_encode_ms;
+    dst->entropy_decode_ms += src.entropy_decode_ms;
+    dst->reconstruct_ms += src.reconstruct_ms;
 }
 
 static bool ensure_buffer_capacity(ByteBuffer *buffer, size_t needed)
@@ -148,16 +220,22 @@ static bool build_sequence_stream_for_block(
     const uint8_t *block_input,
     size_t current_block_size,
     const LzssConfig *config,
-    LzssSequenceStream *sequence_stream)
+    LzssSequenceStream *sequence_stream,
+    LzssBlockTimings *timings)
 {
     if (config->parse_mode != LZSS_PARSE_OPTIMAL &&
         config->parse_mode != LZSS_PARSE_ADAPTIVE_OPTIMAL) {
-        return lzss_encode(
+        const auto parse_start = std::chrono::steady_clock::now();
+        const bool ok = lzss_encode(
             block_input,
             current_block_size,
             config,
             sequence_stream
         );
+        if (timings != nullptr) {
+            timings->parse_ms += elapsed_ms_since(parse_start);
+        }
+        return ok;
     }
 
     LzssConfig seed_config = *config;
@@ -166,40 +244,66 @@ static bool build_sequence_stream_for_block(
     LzssSequenceStream seed_stream;
     sequence_stream_init(&seed_stream, 0);
 
+    auto parse_start = std::chrono::steady_clock::now();
     bool ok = lzss_encode(
         block_input,
         current_block_size,
         &seed_config,
         &seed_stream
     );
+    if (timings != nullptr) {
+        timings->parse_ms += elapsed_ms_since(parse_start);
+    }
 
     if (ok && config->parse_mode == LZSS_PARSE_ADAPTIVE_OPTIMAL) {
         LzssAdaptiveAcCostModel cost_model;
+        const auto model_start = std::chrono::steady_clock::now();
         ok = lzss_adaptive_ac_cost_model_init(
-                 config,
-                 &seed_stream,
-                 &cost_model
-             ) &&
-             lzss_encode_optimal_adaptive_ac(
-                 block_input,
-                 current_block_size,
-                 config,
-                 &cost_model,
-                 sequence_stream
-             );
+            config,
+            &seed_stream,
+            &cost_model
+        );
+        if (timings != nullptr) {
+            timings->model_build_ms += elapsed_ms_since(model_start);
+        }
+
+        if (ok) {
+            parse_start = std::chrono::steady_clock::now();
+            ok = lzss_encode_optimal_adaptive_ac(
+                block_input,
+                current_block_size,
+                config,
+                &cost_model,
+                sequence_stream
+            );
+            if (timings != nullptr) {
+                timings->parse_ms += elapsed_ms_since(parse_start);
+            }
+        }
     } else if (ok) {
         TansCodecGuardForCost cost_codec;
         LzssTansCostModel cost_model;
+        const auto model_start = std::chrono::steady_clock::now();
         ok = cost_codec.init(config) &&
              lzss_tans_build_models(&cost_codec.codec, &seed_stream, true) &&
-             lzss_tans_cost_model_init(&cost_codec.codec, &cost_model) &&
-             lzss_encode_optimal(
-                 block_input,
-                 current_block_size,
-                 config,
-                 &cost_model,
-                 sequence_stream
-             );
+             lzss_tans_cost_model_init(&cost_codec.codec, &cost_model);
+        if (timings != nullptr) {
+            timings->model_build_ms += elapsed_ms_since(model_start);
+        }
+
+        if (ok) {
+            parse_start = std::chrono::steady_clock::now();
+            ok = lzss_encode_optimal(
+                block_input,
+                current_block_size,
+                config,
+                &cost_model,
+                sequence_stream
+            );
+            if (timings != nullptr) {
+                timings->parse_ms += elapsed_ms_since(parse_start);
+            }
+        }
     }
 
     sequence_stream_free(&seed_stream);
@@ -234,7 +338,8 @@ static bool encode_one_block(
             block_input,
             current_block_size,
             config,
-            &sequence_stream)) {
+            &sequence_stream,
+            &result->timings)) {
         sequence_stream_free(&sequence_stream);
         return false;
     }
@@ -256,6 +361,7 @@ static bool encode_one_block(
     );
 
     ac ac_state{};
+    const auto entropy_start = std::chrono::steady_clock::now();
     const bool encoded =
         lzss_adaptive_ac_encode_stream(
             &codec.codec,
@@ -263,6 +369,7 @@ static bool encode_one_block(
             &writer,
             &sequence_stream
         );
+    result->timings.entropy_encode_ms += elapsed_ms_since(entropy_start);
     bio_close(&writer, BIO_MODE_WRITE);
 
     sequence_stream_free(&sequence_stream);
@@ -274,6 +381,12 @@ static bool encode_one_block(
     const size_t used_words =
         static_cast<size_t>(writer.ptr - compressed_words.data());
     compressed_words.resize(used_words);
+    result->payload_stats.rounded_payload_bytes =
+        used_words * sizeof(uint32_t);
+    result->payload_stats.total_stream_bytes =
+        result->payload_stats.rounded_payload_bytes;
+    result->payload_stats.exact_payload_bits =
+        result->payload_stats.rounded_payload_bytes * 8u;
     result->compressed_words = std::move(compressed_words);
     return true;
 }
@@ -282,7 +395,8 @@ static bool decode_one_block(
     const LzssAcBlockStream *stream,
     const LzssConfig *config,
     ByteBuffer *out,
-    size_t block_index)
+    size_t block_index,
+    LzssBlockTimings *timings)
 {
     const size_t block_count = stream->blocks.size();
     const size_t expected_size = block_uncompressed_size(
@@ -315,19 +429,27 @@ static bool decode_one_block(
     );
 
     ac ac_state{};
+    const auto entropy_start = std::chrono::steady_clock::now();
     bool ok = lzss_adaptive_ac_decode_stream(
         &codec.codec,
         &ac_state,
         &reader,
         &decoded_stream
     );
+    if (timings != nullptr) {
+        timings->entropy_decode_ms += elapsed_ms_since(entropy_start);
+    }
 
     ByteBuffer decoded_bytes;
     buffer_init(&decoded_bytes);
     buffer_init_with_capacity(&decoded_bytes, expected_size);
 
     if (ok) {
+        const auto reconstruct_start = std::chrono::steady_clock::now();
         ok = lzss_decode(&decoded_stream, &decoded_bytes);
+        if (timings != nullptr) {
+            timings->reconstruct_ms += elapsed_ms_since(reconstruct_start);
+        }
     }
 
     if (ok && decoded_bytes.size == expected_size && expected_size > 0) {
@@ -354,6 +476,8 @@ void lzss_ac_block_stream_init(LzssAcBlockStream *stream)
     stream->block_size = LZSS_TANS_DEFAULT_BLOCK_SIZE;
     stream->blocks.clear();
     stream->stats = {};
+    stream->payload_stats = {};
+    stream->timings = {};
 }
 
 void lzss_ac_block_stream_clear(LzssAcBlockStream *stream)
@@ -458,6 +582,11 @@ bool lzss_ac_encode_blocks(
             working.blocks[block_index].compressed_words =
                 std::move(results[block_index].compressed_words);
             add_stats(&working.stats, results[block_index].stats);
+            add_payload_stats(
+                &working.payload_stats,
+                results[block_index].payload_stats
+            );
+            add_timings(&working.timings, results[block_index].timings);
         }
 
         *out_stream = std::move(working);
@@ -471,7 +600,8 @@ bool lzss_ac_decode_blocks(
     const LzssAcBlockStream *stream,
     size_t max_workers,
     const LzssConfig *config,
-    ByteBuffer *out)
+    ByteBuffer *out,
+    LzssBlockTimings *timings)
 {
     if (stream == nullptr ||
         config == nullptr ||
@@ -495,6 +625,7 @@ bool lzss_ac_decode_blocks(
 
         std::atomic<size_t> next_block{0};
         std::atomic<bool> ok{true};
+        std::vector<LzssBlockTimings> block_timings(stream->blocks.size());
 
         const size_t worker_count =
             worker_count_for(stream->blocks.size(), max_workers);
@@ -516,7 +647,8 @@ bool lzss_ac_decode_blocks(
                                 stream,
                                 config,
                                 out,
-                                block_index)) {
+                                block_index,
+                                &block_timings[block_index])) {
                             ok.store(false, std::memory_order_relaxed);
                             return;
                         }
@@ -535,6 +667,13 @@ bool lzss_ac_decode_blocks(
         if (!ok.load(std::memory_order_relaxed)) {
             out->size = 0;
             return false;
+        }
+
+        if (timings != nullptr) {
+            *timings = {};
+            for (const LzssBlockTimings& block_timing : block_timings) {
+                add_timings(timings, block_timing);
+            }
         }
 
         out->size = stream->original_size;

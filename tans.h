@@ -71,6 +71,22 @@ struct LzssTansCodec {
     bool literal_tans_ready;
     bool length_tans_ready;
     bool distance_tans_ready;
+
+    double empirical_entropy_bits;
+    double normalized_model_bits;
+};
+
+struct LzssTansStreamStats {
+    size_t exact_payload_bits = 0;
+    size_t rounded_payload_bytes = 0;
+    size_t model_header_bits = 0;
+    size_t tans_stream_bits = 0;
+    size_t extra_stream_bits = 0;
+    size_t padding_bits = 0;
+    size_t total_stream_bytes = 0;
+    double empirical_entropy_bits = 0.0;
+    double normalization_loss_bits = 0.0;
+    double tans_coder_overhead_bits = 0.0;
 };
 
 struct LzssTansCostModel {
@@ -98,7 +114,8 @@ void lzss_tans_codec_destroy(
 bool lzss_tans_encode_stream(
     LzssTansCodec *codec,
     struct bio *bio,
-    const LzssSequenceStream *stream
+    const LzssSequenceStream *stream,
+    LzssTansStreamStats *stats = nullptr
 );
 
 bool lzss_tans_build_models(
@@ -110,7 +127,8 @@ bool lzss_tans_build_models(
 bool lzss_tans_encode_stream_with_current_models(
     LzssTansCodec *codec,
     struct bio *bio,
-    const LzssSequenceStream *stream
+    const LzssSequenceStream *stream,
+    LzssTansStreamStats *stats = nullptr
 );
 
 bool lzss_tans_cost_model_init(
