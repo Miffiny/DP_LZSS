@@ -14,6 +14,7 @@ typedef struct {
 
 LzssMatchFinder* match_finder_create(size_t window_size,
                                      LzssHashMode hash_mode);
+LzssMatchFinder* match_finder_create_for_config(const LzssConfig *config);
 void match_finder_destroy(LzssMatchFinder* mf);
 void match_finder_insert_position(LzssMatchFinder *mf, const uint8_t *input,
                                   size_t position, size_t buffer_size);

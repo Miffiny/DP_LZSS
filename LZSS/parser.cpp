@@ -71,8 +71,7 @@ bool lzss_encode(const uint8_t* input, size_t input_size,
         return false;
     }
 
-    LzssMatchFinder* mf =
-        match_finder_create(config->window_size, config->hash_mode);
+    LzssMatchFinder* mf = match_finder_create_for_config(config);
     if (!mf) return false;
 
     size_t pos = 0;

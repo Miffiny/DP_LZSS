@@ -10,6 +10,10 @@
 struct LzssMatchFinder {
     size_t window_size;
     size_t hash_bytes;
+    size_t hash_size;
+    size_t max_chain_length;
+    size_t good_match_length;
+    size_t optimal_max_chain_length;
     uint32_t key_mask;
     std::vector<size_t> head;
     std::vector<size_t> next;
@@ -18,10 +22,6 @@ struct LzssMatchFinder {
 
 static constexpr size_t NO_POSITION = std::numeric_limits<size_t>::max();
 static constexpr size_t HASH_LOAD_BYTES = sizeof(uint32_t);
-static constexpr size_t HASH_SIZE = 1u << 17;
-static constexpr size_t MAX_CHAIN_LENGTH = 256;
-static constexpr size_t OPTIMAL_MAX_CHAIN_LENGTH = 1024;
-static constexpr size_t GOOD_MATCH_LENGTH = 32;
 static constexpr uint32_t HASH3_KEY_MASK = 0x00ffffffu;
 static constexpr uint32_t HASH4_KEY_MASK = 0xffffffffu;
 
@@ -66,12 +66,17 @@ static uint32_t load_match_key(
     return load32(buffer, pos) & mf->key_mask;
 }
 
-static size_t hash_key(uint32_t value)
+static bool is_power_of_two(size_t value)
+{
+    return value != 0 && (value & (value - 1)) == 0;
+}
+
+static size_t hash_key(const LzssMatchFinder *mf, uint32_t value)
 {
     value ^= value >> 9;
     value *= 0x9e3779b1u;
     value ^= value >> 16;
-    return value & (HASH_SIZE - 1);
+    return value & (mf->hash_size - 1);
 }
 
 static size_t count_match_length(const uint8_t *buffer,
@@ -94,9 +99,20 @@ static size_t count_match_length(const uint8_t *buffer,
     return len;
 }
 
-LzssMatchFinder* match_finder_create(size_t window_size,
-                                     LzssHashMode hash_mode) {
-    if (window_size == 0) {
+static LzssMatchFinder* match_finder_create_with_options(
+    size_t window_size,
+    LzssHashMode hash_mode,
+    size_t hash_size,
+    size_t max_chain_length,
+    size_t good_match_length,
+    size_t optimal_max_chain_length)
+{
+    if (window_size == 0 ||
+        hash_size == 0 ||
+        !is_power_of_two(hash_size) ||
+        max_chain_length == 0 ||
+        good_match_length == 0 ||
+        optimal_max_chain_length == 0) {
         return nullptr;
     }
 
@@ -104,13 +120,53 @@ LzssMatchFinder* match_finder_create(size_t window_size,
     if (mf != nullptr) {
         mf->window_size = window_size;
         mf->hash_bytes = hash_mode == LZSS_HASH3 ? 3 : 4;
+        mf->hash_size = hash_size;
+        mf->max_chain_length = max_chain_length;
+        mf->good_match_length = good_match_length;
+        mf->optimal_max_chain_length = optimal_max_chain_length;
         mf->key_mask =
             hash_mode == LZSS_HASH3 ? HASH3_KEY_MASK : HASH4_KEY_MASK;
-        mf->head.assign(HASH_SIZE, NO_POSITION);
+        mf->head.assign(hash_size, NO_POSITION);
         mf->next.assign(window_size, NO_POSITION);
         mf->slot_position.assign(window_size, NO_POSITION);
     }
     return mf;
+}
+
+LzssMatchFinder* match_finder_create(size_t window_size,
+                                     LzssHashMode hash_mode) {
+    return match_finder_create_with_options(
+        window_size,
+        hash_mode,
+        LZSS_DEFAULT_HASH_SIZE,
+        LZSS_DEFAULT_MAX_CHAIN_LENGTH,
+        LZSS_DEFAULT_GOOD_MATCH_LENGTH,
+        LZSS_DEFAULT_OPTIMAL_MAX_CHAIN_LENGTH
+    );
+}
+
+LzssMatchFinder* match_finder_create_for_config(const LzssConfig *config)
+{
+    if (config == nullptr) {
+        return nullptr;
+    }
+
+    return match_finder_create_with_options(
+        config->window_size,
+        config->hash_mode,
+        config->hash_size == 0
+            ? LZSS_DEFAULT_HASH_SIZE
+            : config->hash_size,
+        config->max_chain_length == 0
+            ? LZSS_DEFAULT_MAX_CHAIN_LENGTH
+            : config->max_chain_length,
+        config->good_match_length == 0
+            ? LZSS_DEFAULT_GOOD_MATCH_LENGTH
+            : config->good_match_length,
+        config->optimal_max_chain_length == 0
+            ? LZSS_DEFAULT_OPTIMAL_MAX_CHAIN_LENGTH
+            : config->optimal_max_chain_length
+    );
 }
 
 void match_finder_destroy(LzssMatchFinder* mf) {
@@ -124,7 +180,7 @@ void match_finder_insert_position(LzssMatchFinder *mf, const uint8_t *input,
         return;
     }
 
-    const size_t hash = hash_key(load_match_key(mf, input, position));
+    const size_t hash = hash_key(mf, load_match_key(mf, input, position));
     const size_t slot = window_slot(mf, position);
 
     mf->next[slot] = mf->head[hash];
@@ -153,11 +209,12 @@ bool match_finder_get_best(LzssMatchFinder* mf, const uint8_t* buffer,
     }
 
     const uint32_t current_key = load_match_key(mf, buffer, pos);
-    const size_t hash = hash_key(current_key);
+    const size_t hash = hash_key(mf, current_key);
     size_t search_pos = mf->head[hash];
     size_t chain_len = 0;
 
-    while (search_pos != NO_POSITION && chain_len < MAX_CHAIN_LENGTH) {
+    while (search_pos != NO_POSITION &&
+           chain_len < mf->max_chain_length) {
         ++chain_len;
 
         if (search_pos >= pos) {
@@ -196,7 +253,7 @@ bool match_finder_get_best(LzssMatchFinder* mf, const uint8_t* buffer,
             best_dist = distance;
 
             const size_t good_match_length =
-                std::min(GOOD_MATCH_LENGTH, max_len);
+                std::min(mf->good_match_length, max_len);
             if (best_len >= good_match_length) break;
         }
 
@@ -232,7 +289,7 @@ bool match_finder_get_matches(LzssMatchFinder* mf, const uint8_t* buffer,
     }
 
     const uint32_t current_key = load_match_key(mf, buffer, pos);
-    const size_t hash = hash_key(current_key);
+    const size_t hash = hash_key(mf, current_key);
     size_t search_pos = mf->head[hash];
     std::vector<size_t> best_distances(max_len + 1, 0);
     size_t remaining_lengths = max_len - min_len + 1;
@@ -240,7 +297,7 @@ bool match_finder_get_matches(LzssMatchFinder* mf, const uint8_t* buffer,
 
     while (search_pos != NO_POSITION &&
            remaining_lengths > 0 &&
-           chain_len < OPTIMAL_MAX_CHAIN_LENGTH) {
+           chain_len < mf->optimal_max_chain_length) {
         ++chain_len;
 
         if (search_pos >= pos) {

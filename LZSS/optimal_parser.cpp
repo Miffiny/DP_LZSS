@@ -427,7 +427,7 @@ bool lzss_encode_optimal(
     }
 
     LzssMatchFinder *match_finder =
-        match_finder_create(config->window_size, config->hash_mode);
+        match_finder_create_for_config(config);
     if (match_finder == nullptr) {
         return false;
     }
@@ -588,7 +588,7 @@ bool lzss_encode_optimal_adaptive_ac(
     }
 
     LzssMatchFinder *match_finder =
-        match_finder_create(config->window_size, config->hash_mode);
+        match_finder_create_for_config(config);
     if (match_finder == nullptr) {
         return false;
     }

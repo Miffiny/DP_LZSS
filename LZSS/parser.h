@@ -22,10 +22,21 @@ typedef enum {
     LZSS_DISTANCE_BIT_TREE
 } LzssDistanceCodingMode;
 
+static constexpr size_t LZSS_DEFAULT_MAX_CHAIN_LENGTH = 256;
+static constexpr size_t LZSS_DEFAULT_GOOD_MATCH_LENGTH = 32;
+static constexpr size_t LZSS_DEFAULT_OPTIMAL_MAX_CHAIN_LENGTH = 1024;
+static constexpr size_t LZSS_DEFAULT_HASH_SIZE = 1u << 17;
+static constexpr size_t LZSS_DEFAULT_TANS_TABLE_LOG = 12;
+
 typedef struct {
     size_t window_size;
     size_t min_match_length;
     size_t max_match_length;
+    size_t max_chain_length;
+    size_t good_match_length;
+    size_t optimal_max_chain_length;
+    size_t hash_size;
+    size_t tans_table_log;
     LzssParseMode parse_mode;
     LzssHashMode hash_mode;
     LzssDistanceCodingMode distance_coding;

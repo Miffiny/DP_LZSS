@@ -11,32 +11,39 @@ extern "C" {
 #endif
 
 #define TANS_L 4096
+#define TANS_DEFAULT_TABLE_LOG 12
 
 struct tans_decode_entry {
-    uint16_t new_x;
-    uint16_t symbol;
+    uint32_t new_x;
+    uint32_t symbol;
     uint8_t num_bits;
 };
 
 struct tans_model {
-    struct tans_decode_entry decode_table[TANS_L];
-
-    uint16_t* symbol_cum;
-    uint16_t* symbol_freqs;
+    struct tans_decode_entry *decode_table;
+    uint32_t* symbol_cum;
+    uint32_t* symbol_freqs;
     uint32_t count;
+    uint32_t table_size;
+    uint8_t table_log;
 };
 
 struct tans_state {
     uint32_t x;
+    uint32_t table_size;
+    uint8_t table_log;
 };
 
 int tans_model_init(struct tans_model *tm, const struct model *m);
+int tans_model_init_log(struct tans_model *tm, const struct model *m, uint8_t table_log);
 void tans_model_destroy(struct tans_model *tm);
 
 void tans_encode_init(struct tans_state *ts);
+void tans_encode_init_log(struct tans_state *ts, uint8_t table_log);
 void tans_encode_flush(struct tans_state *ts, struct bio *bio);
 
 void tans_decode_init(struct tans_state *ts, struct bio *bio);
+void tans_decode_init_log(struct tans_state *ts, struct bio *bio, uint8_t table_log);
 size_t tans_decode_symbol(struct tans_state *ts, struct bio *bio, const struct tans_model *tm);
 
 #ifdef __cplusplus

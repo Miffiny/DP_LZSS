@@ -11,26 +11,44 @@ struct tans_bit_chunk {
     uint8_t count;
 };
 
-int tans_model_init(struct tans_model *tm, const struct model *m)
+static uint32_t tans_table_size_for_log(uint8_t table_log)
 {
-    if (tm == NULL || m == NULL || m->total != TANS_L) {
+    return (uint32_t)1 << table_log;
+}
+
+int tans_model_init_log(struct tans_model *tm, const struct model *m, uint8_t table_log)
+{
+    const uint32_t table_size = tans_table_size_for_log(table_log);
+
+    if (tm == NULL || m == NULL || m->total != table_size) {
         return 0;
     }
 
-    tm->count = m->count;
-    tm->symbol_cum = (uint16_t*)malloc(m->count * sizeof(uint16_t));
-    tm->symbol_freqs = (uint16_t*)malloc(m->count * sizeof(uint16_t));
+    tm->decode_table = NULL;
+    tm->symbol_cum = NULL;
+    tm->symbol_freqs = NULL;
+    tm->count = 0;
+    tm->table_size = 0;
+    tm->table_log = 0;
 
-    if (!tm->symbol_cum || !tm->symbol_freqs) {
+    tm->count = m->count;
+    tm->table_size = table_size;
+    tm->table_log = table_log;
+    tm->decode_table =
+        (struct tans_decode_entry*)malloc(table_size * sizeof(struct tans_decode_entry));
+    tm->symbol_cum = (uint32_t*)malloc(m->count * sizeof(uint32_t));
+    tm->symbol_freqs = (uint32_t*)malloc(m->count * sizeof(uint32_t));
+
+    if (!tm->decode_table || !tm->symbol_cum || !tm->symbol_freqs) {
         tans_model_destroy(tm);
         return 0;
     }
 
     for (size_t s = 0; s < m->count; ++s) {
         if (m->table[s].symb >= m->count ||
-            m->table[s].freq > TANS_L ||
-            m->table[s].cum_freq > TANS_L ||
-            m->table[s].cum_freq + m->table[s].freq > TANS_L) {
+            m->table[s].freq > table_size ||
+            m->table[s].cum_freq > table_size ||
+            m->table[s].cum_freq + m->table[s].freq > table_size) {
             tans_model_destroy(tm);
             return 0;
         }
@@ -52,33 +70,50 @@ int tans_model_init(struct tans_model *tm, const struct model *m)
             uint32_t base_x = decoded_x;
             uint8_t bits = 0;
 
-            while (base_x < TANS_L) {
+            while (base_x < table_size) {
                 base_x <<= 1;
                 ++bits;
             }
 
-            tm->decode_table[slot].symbol = (uint16_t)s;
+            tm->decode_table[slot].symbol = (uint32_t)s;
             tm->decode_table[slot].num_bits = bits;
-            tm->decode_table[slot].new_x = (uint16_t)base_x;
+            tm->decode_table[slot].new_x = base_x;
         }
     }
 
     return 1;
 }
 
+int tans_model_init(struct tans_model *tm, const struct model *m)
+{
+    return tans_model_init_log(tm, m, TANS_DEFAULT_TABLE_LOG);
+}
+
 void tans_model_destroy(struct tans_model *tm)
 {
     if (tm) {
+        free(tm->decode_table);
         free(tm->symbol_cum);
         free(tm->symbol_freqs);
+        tm->decode_table = NULL;
         tm->symbol_cum = NULL;
         tm->symbol_freqs = NULL;
+        tm->count = 0;
+        tm->table_size = 0;
+        tm->table_log = 0;
     }
+}
+
+void tans_encode_init_log(struct tans_state *ts, uint8_t table_log)
+{
+    ts->table_size = tans_table_size_for_log(table_log);
+    ts->table_log = table_log;
+    ts->x = ts->table_size;
 }
 
 void tans_encode_init(struct tans_state *ts)
 {
-    ts->x = TANS_L;
+    tans_encode_init_log(ts, TANS_DEFAULT_TABLE_LOG);
 }
 
 static struct tans_bit_chunk tans_encode_symbol_to_chunk(
@@ -102,23 +137,30 @@ static struct tans_bit_chunk tans_encode_symbol_to_chunk(
         chunk.bits = ts->x & (((uint32_t)1 << chunk.count) - 1);
     }
 
-    ts->x = TANS_L + cum + temp_x - freq;
+    ts->x = tm->table_size + cum + temp_x - freq;
     return chunk;
 }
 
 void tans_encode_flush(struct tans_state *ts, struct bio *bio)
 {
-    bio_write_bits(bio, ts->x - TANS_L, 12);
+    bio_write_bits(bio, ts->x - ts->table_size, ts->table_log);
+}
+
+void tans_decode_init_log(struct tans_state *ts, struct bio *bio, uint8_t table_log)
+{
+    ts->table_size = tans_table_size_for_log(table_log);
+    ts->table_log = table_log;
+    ts->x = bio_read_bits(bio, table_log) + ts->table_size;
 }
 
 void tans_decode_init(struct tans_state *ts, struct bio *bio)
 {
-    ts->x = bio_read_bits(bio, 12) + TANS_L;
+    tans_decode_init_log(ts, bio, TANS_DEFAULT_TABLE_LOG);
 }
 
 size_t tans_decode_symbol(struct tans_state *ts, struct bio *bio, const struct tans_model *tm)
 {
-    const struct tans_decode_entry *entry = &tm->decode_table[ts->x - TANS_L];
+    const struct tans_decode_entry *entry = &tm->decode_table[ts->x - tm->table_size];
 
     uint32_t new_bits = bio_read_bits(bio, entry->num_bits);
 
@@ -127,8 +169,9 @@ size_t tans_decode_symbol(struct tans_state *ts, struct bio *bio, const struct t
     return entry->symbol;
 }
 
-static constexpr size_t STATIC_MODEL_TOTAL = TANS_L;
 static constexpr size_t REP_DISTANCE_COUNT = 3;
+static constexpr size_t MIN_TANS_TABLE_LOG = 8;
+static constexpr size_t MAX_TANS_TABLE_LOG = 16;
 
 struct DeflateClass {
     uint32_t base;
@@ -184,6 +227,12 @@ static const DeflateClass DISTANCE_CLASSES[] = {
     {131073, 65536, 16}, {196609, 65536, 16},
     {262145, 131072, 17}, {393217, 131072, 17},
     {524289, 262144, 18}, {786433, 262144, 18},
+    {1048577, 524288, 19}, {1572865, 524288, 19},
+    {2097153, 1048576, 20}, {3145729, 1048576, 20},
+    {4194305, 2097152, 21}, {6291457, 2097152, 21},
+    {8388609, 4194304, 22}, {12582913, 4194304, 22},
+    {16777217, 8388608, 23}, {25165825, 8388608, 23},
+    {33554433, 16777216, 24}, {50331649, 16777216, 24},
 };
 
 template <typename T, size_t N>
@@ -500,6 +549,11 @@ static bool is_valid_config(const LzssConfig *config)
         return false;
     }
 
+    if (config->tans_table_log < MIN_TANS_TABLE_LOG ||
+        config->tans_table_log > MAX_TANS_TABLE_LOG) {
+        return false;
+    }
+
     if (config->min_match_length < LENGTH_CLASSES[0].base ||
         static_cast<uint64_t>(config->max_match_length) >
             class_last_value(&LENGTH_CLASSES[array_count(LENGTH_CLASSES) - 1])) {
@@ -587,11 +641,14 @@ static uint32_t read_u32(struct bio *bio)
 
 static bool model_set_frequencies_tans(
     struct model *model,
-    const std::vector<uint32_t>& frequencies)
+    const std::vector<uint32_t>& frequencies,
+    size_t target_total)
 {
     if (model == nullptr ||
         model->table == nullptr ||
-        model->count != frequencies.size()) {
+        model->count != frequencies.size() ||
+        target_total == 0 ||
+        target_total > UINT32_MAX) {
         return false;
     }
 
@@ -614,7 +671,7 @@ static bool model_set_frequencies_tans(
     std::vector<uint32_t> scaled_frequencies(model->count, 0);
 
     if (total != 0) {
-        if (positive_count > STATIC_MODEL_TOTAL) {
+        if (positive_count > target_total) {
             return false;
         }
 
@@ -628,7 +685,7 @@ static bool model_set_frequencies_tans(
 
             const uint64_t product =
                 static_cast<uint64_t>(frequencies[i]) *
-                static_cast<uint64_t>(STATIC_MODEL_TOTAL);
+                static_cast<uint64_t>(target_total);
             uint32_t scaled =
                 static_cast<uint32_t>(product / total);
 
@@ -641,7 +698,7 @@ static bool model_set_frequencies_tans(
             scaled_total += scaled;
         }
 
-        while (scaled_total > STATIC_MODEL_TOTAL) {
+        while (scaled_total > target_total) {
             size_t reduce_index = model->count;
 
             for (size_t i = 0; i < model->count; ++i) {
@@ -663,7 +720,7 @@ static bool model_set_frequencies_tans(
             --scaled_total;
         }
 
-        while (scaled_total < STATIC_MODEL_TOTAL) {
+        while (scaled_total < target_total) {
             size_t increase_index = model->count;
 
             for (size_t i = 0; i < model->count; ++i) {
@@ -718,7 +775,10 @@ static bool write_model_frequencies(struct bio *bio, const struct model *model)
     return true;
 }
 
-static bool read_model_frequencies(struct bio *bio, struct model *model)
+static bool read_model_frequencies(
+    struct bio *bio,
+    struct model *model,
+    size_t target_total)
 {
     if (bio == nullptr || model == nullptr || model->table == nullptr) {
         return false;
@@ -730,7 +790,7 @@ static bool read_model_frequencies(struct bio *bio, struct model *model)
         frequencies[i] = read_u32(bio);
     }
 
-    return model_set_frequencies_tans(model, frequencies);
+    return model_set_frequencies_tans(model, frequencies, target_total);
 }
 
 static double model_symbol_cost(const struct model *model, size_t symbol);
@@ -813,10 +873,25 @@ static bool read_static_model_header(
     struct bio *bio,
     LzssTansCodec *codec)
 {
-    if (!read_model_frequencies(bio, &codec->literal_length_model) ||
-        !read_model_frequencies(bio, &codec->literal_model) ||
-        !read_model_frequencies(bio, &codec->length_model) ||
-        !read_model_frequencies(bio, &codec->distance_model)) {
+    const size_t target_total =
+        static_cast<size_t>(1) << codec->config.tans_table_log;
+
+    if (!read_model_frequencies(
+            bio,
+            &codec->literal_length_model,
+            target_total) ||
+        !read_model_frequencies(
+            bio,
+            &codec->literal_model,
+            target_total) ||
+        !read_model_frequencies(
+            bio,
+            &codec->length_model,
+            target_total) ||
+        !read_model_frequencies(
+            bio,
+            &codec->distance_model,
+            target_total)) {
         return false;
     }
 
@@ -840,6 +915,8 @@ static bool collect_static_model_stats(
     std::vector<uint32_t> length_frequencies(codec->length_model.count, 0);
     std::vector<uint32_t> distance_frequencies(codec->distance_model.count, 0);
     RepeatDistanceState repeat_state{};
+    const size_t target_total =
+        static_cast<size_t>(1) << codec->config.tans_table_log;
 
     for (size_t i = 0; i < stream->sequences.size(); ++i) {
         const LzssSequence& sequence = stream->sequences[i];
@@ -938,16 +1015,20 @@ static bool collect_static_model_stats(
 
     if (!model_set_frequencies_tans(
             &codec->literal_length_model,
-            literal_length_frequencies) ||
+            literal_length_frequencies,
+            target_total) ||
         !model_set_frequencies_tans(
             &codec->literal_model,
-            literal_frequencies) ||
+            literal_frequencies,
+            target_total) ||
         !model_set_frequencies_tans(
             &codec->length_model,
-            length_frequencies) ||
+            length_frequencies,
+            target_total) ||
         !model_set_frequencies_tans(
             &codec->distance_model,
-            distance_frequencies)) {
+            distance_frequencies,
+            target_total)) {
         return false;
     }
 
@@ -979,6 +1060,8 @@ static bool collect_static_model_stats(
 static bool init_tans_model_if_used(
     struct tans_model *tans_model,
     const struct model *model,
+    size_t target_total,
+    uint8_t table_log,
     bool *ready)
 {
     *ready = false;
@@ -987,8 +1070,8 @@ static bool init_tans_model_if_used(
         return true;
     }
 
-    if (model->total != STATIC_MODEL_TOTAL ||
-        !tans_model_init(tans_model, model)) {
+    if (model->total != target_total ||
+        !tans_model_init_log(tans_model, model, table_log)) {
         return false;
     }
 
@@ -998,21 +1081,34 @@ static bool init_tans_model_if_used(
 
 static bool init_all_tans_models(LzssTansCodec *codec)
 {
+    const size_t target_total =
+        static_cast<size_t>(1) << codec->config.tans_table_log;
+    const uint8_t table_log =
+        static_cast<uint8_t>(codec->config.tans_table_log);
+
     return init_tans_model_if_used(
                &codec->literal_length_tans_model,
                &codec->literal_length_model,
+               target_total,
+               table_log,
                &codec->literal_length_tans_ready) &&
            init_tans_model_if_used(
                &codec->literal_tans_model,
                &codec->literal_model,
+               target_total,
+               table_log,
                &codec->literal_tans_ready) &&
            init_tans_model_if_used(
                &codec->length_tans_model,
                &codec->length_model,
+               target_total,
+               table_log,
                &codec->length_tans_ready) &&
            init_tans_model_if_used(
                &codec->distance_tans_model,
                &codec->distance_model,
+               target_total,
+               table_log,
                &codec->distance_tans_ready);
 }
 
@@ -1733,7 +1829,10 @@ bool lzss_tans_encode_stream_with_current_models(
     }
 
     struct tans_state state{};
-    tans_encode_init(&state);
+    tans_encode_init_log(
+        &state,
+        static_cast<uint8_t>(codec->config.tans_table_log)
+    );
 
     size_t distance_symbol_index = distance_symbols.size();
     for (size_t i = stream->sequences.size(); i > 0; --i) {
@@ -1792,7 +1891,7 @@ bool lzss_tans_encode_stream_with_current_models(
 
     bio_close(&extra_writer, BIO_MODE_WRITE);
 
-    size_t tans_bit_count = 12;
+    size_t tans_bit_count = codec->config.tans_table_log;
     for (const struct tans_bit_chunk& chunk : tans_chunks) {
         tans_bit_count += chunk.count;
     }
@@ -2140,7 +2239,11 @@ bool lzss_tans_decode_stream(
     );
 
     struct tans_state state{};
-    tans_decode_init(&state, &tans_reader);
+    tans_decode_init_log(
+        &state,
+        &tans_reader,
+        static_cast<uint8_t>(codec->config.tans_table_log)
+    );
 
     out_stream->sequences.clear();
     out_stream->literals.clear();

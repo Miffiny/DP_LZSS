@@ -258,6 +258,9 @@ static const char *csv_header_text()
 {
     return
         "mode,entropy_codec,parse_mode,tans_table_mode,"
+        "window_size,min_match_length,max_match_length,"
+        "max_chain_length,good_match_length,optimal_max_chain_length,"
+        "hash_size,tans_table_log,max_workers,"
         "file,input_bytes,block_size,blocks,"
         "exact_payload_bits,rounded_payload_bytes,model_header_bits,"
         "tans_stream_bits,extra_stream_bits,padding_bits,"
@@ -341,6 +344,15 @@ static void write_csv_row(
             : ""
     );
     csv << ',';
+    csv << config.lzss.window_size << ','
+        << config.lzss.min_match_length << ','
+        << config.lzss.max_match_length << ','
+        << config.lzss.max_chain_length << ','
+        << config.lzss.good_match_length << ','
+        << config.lzss.optimal_max_chain_length << ','
+        << config.lzss.hash_size << ','
+        << config.lzss.tans_table_log << ','
+        << config.max_workers << ',';
     write_csv_escaped(csv, file_name);
     csv << ','
         << input_size << ','
@@ -480,6 +492,27 @@ static bool parse_size(
 
     *out = static_cast<size_t>(parsed);
     return true;
+}
+
+static bool parse_optional_size(
+    const std::unordered_map<std::string, std::string>& values,
+    const char *key,
+    size_t default_value,
+    size_t *out,
+    std::ostream& err)
+{
+    const auto it = values.find(key);
+    if (it == values.end() || it->second.empty()) {
+        *out = default_value;
+        return true;
+    }
+
+    return parse_size(values, key, out, err);
+}
+
+static bool is_power_of_two(size_t value)
+{
+    return value != 0 && (value & (value - 1)) == 0;
 }
 
 static bool parse_parse_mode(
@@ -709,6 +742,21 @@ static bool load_benchmark_config(
                     &config->lzss.min_match_length, err) ||
         !parse_size(values, "max_match_length",
                     &config->lzss.max_match_length, err) ||
+        !parse_optional_size(values, "max_chain_length",
+                    LZSS_DEFAULT_MAX_CHAIN_LENGTH,
+                    &config->lzss.max_chain_length, err) ||
+        !parse_optional_size(values, "good_match_length",
+                    LZSS_DEFAULT_GOOD_MATCH_LENGTH,
+                    &config->lzss.good_match_length, err) ||
+        !parse_optional_size(values, "optimal_max_chain_length",
+                    LZSS_DEFAULT_OPTIMAL_MAX_CHAIN_LENGTH,
+                    &config->lzss.optimal_max_chain_length, err) ||
+        !parse_optional_size(values, "hash_size",
+                    LZSS_DEFAULT_HASH_SIZE,
+                    &config->lzss.hash_size, err) ||
+        !parse_optional_size(values, "tans_table_log",
+                    LZSS_DEFAULT_TANS_TABLE_LOG,
+                    &config->lzss.tans_table_log, err) ||
         !parse_size(values, "block_size", &config->block_size, err) ||
         !parse_size(values, "max_workers", &config->max_workers, err) ||
         !parse_parse_mode(values, &config->lzss.parse_mode, err) ||
@@ -724,10 +772,23 @@ static bool load_benchmark_config(
     if (config->lzss.window_size == 0 ||
         config->lzss.min_match_length == 0 ||
         config->lzss.max_match_length < config->lzss.min_match_length ||
+        config->lzss.max_chain_length == 0 ||
+        config->lzss.good_match_length == 0 ||
+        config->lzss.optimal_max_chain_length == 0 ||
+        config->lzss.hash_size == 0 ||
         config->block_size == 0 ||
         config->max_workers == 0) {
         err << "Invalid config: sizes must be positive and "
             << "max_match_length must be >= min_match_length\n";
+        return false;
+    }
+    if (!is_power_of_two(config->lzss.hash_size)) {
+        err << "Invalid config: hash_size must be a power of two\n";
+        return false;
+    }
+    if (config->lzss.tans_table_log < 8 ||
+        config->lzss.tans_table_log > 16) {
+        err << "Invalid config: tans_table_log must be in 8..16\n";
         return false;
     }
     if (config->lzss.min_match_length < hash_match_length) {
@@ -1033,11 +1094,17 @@ bool run_silesia_benchmark(std::ostream& out, std::ostream& err)
     header << "Window size = " << config.window_size << " bytes\n";
     header << "Match length = " << config.min_match_length << ".."
         << config.max_match_length << " bytes\n";
+    header << "Max chain length = " << config.max_chain_length << "\n";
+    header << "Good match length = " << config.good_match_length << "\n";
+    header << "Optimal max chain length = "
+        << config.optimal_max_chain_length << "\n";
+    header << "Hash size = " << config.hash_size << "\n";
     header << "Parse mode = " << parse_mode_name(config.parse_mode) << "\n";
     if (benchmark_config.entropy_codec == ENTROPY_CODEC_TANS) {
         header << "tANS table mode = "
             << tans_table_mode_name(benchmark_config.tans_table_mode)
             << "\n";
+        header << "tANS table log = " << config.tans_table_log << "\n";
     }
     header << "Hash mode = " << hash_mode_name(config.hash_mode) << "\n";
     header << "Distance coding = "
